@@ -22,7 +22,9 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 
 # nvm 的 node 加入 PATH
 ENV PATH="/home/dev/.nvm/versions/node/v22.22.0/bin:${PATH}"
-ENV NODE_ENV=development
+# 注意:不要设 NODE_ENV=development —— 它会污染 next build,让 React 加载 dev
+# 构建,导致 /_global-error 静态预渲染崩溃(useContext of null)。npm install
+# 默认就会安装 devDependencies,无需设置 NODE_ENV。
 # better-sqlite3 预编译下载走代理;electron 桌面二进制在 web 部署里用不到,跳过
 ENV http_proxy=${HTTP_PROXY_URL} \
     https_proxy=${HTTP_PROXY_URL} \
