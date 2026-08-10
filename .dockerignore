@@ -1,0 +1,57 @@
+# 容器内 build —— 排除会在容器里重建的产物和无关文件。
+# 保留:src/ apps/ public/ scripts/ + 根级构建配置(next.config.ts /
+# tsconfig.json / postcss.config.mjs / cache-handler.js / package*.json)。
+
+# 依赖与构建产物(容器内 npm install + npm run build 会重建)
+node_modules
+.next
+dist-electron
+release
+apps/*/node_modules
+apps/*/.next
+
+# 版本控制与 CI
+.git
+.github
+.husky
+
+# 桌面端打包(web 部署用不到)
+electron-builder.yml
+build
+resources
+themes
+
+# 测试与报告
+test-results
+playwright-report
+visual-reports
+playwright.config.ts
+
+# 文档(不影响构建)
+docs
+*.md
+AGENTS.md
+ARCHITECTURE.md
+CHANGELOG.md
+CLAUDE.md
+LICENSE
+README*
+RELEASE_NOTES.md
+资料
+
+# 运行时数据 / 本地配置
+.codepilot
+.codex
+.claude
+.mcp.json
+
+# OS / 编辑器
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.iml
+
+# Docker 自身
+Dockerfile
+.dockerignore
