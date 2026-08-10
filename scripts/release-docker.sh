@@ -158,7 +158,10 @@ info "等待服务就绪(健康检查 /api/health)..."
 HEALTH_URL="http://localhost:${PORT}/api/health"
 OK=0
 for i in $(seq 1 30); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)"
+  # --noproxy '*' 必须:调用者环境常设 http_proxy/https_proxy(供构建期
+  # 走代理下载),若不绕过,curl 会把本地 localhost 请求也发给代理,导致
+  # 健康检查恒返回 503/000。
+  code="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)"
   if [ "$code" = "200" ]; then OK=1; break; fi
   # 容器提前退出则快速失败
   if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
