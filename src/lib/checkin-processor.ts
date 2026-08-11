@@ -66,11 +66,12 @@ export async function processCheckin(
 
   try {
     const resolved = resolveProvider({
+      callScene: 'user_checkin',
       sessionProviderId: session?.provider_id || undefined,
       sessionModel: session?.model || undefined,
     });
     const providerId = resolved.provider?.id || 'env';
-    const model = resolved.upstreamModel || resolved.model || getSetting('default_model') || 'claude-sonnet-4-20250514';
+    const model = resolved.upstreamModel || resolved.model || getSetting('default_model') || 'claude-sonnet-4-6';
 
     const dailyMemoryPrompt = `You maintain daily memory entries for an AI assistant. Given the user's daily check-in answers, generate a daily memory entry for ${today}.
 
@@ -111,9 +112,9 @@ Today's check-in (${today}):
 ${qaText}`;
 
     const [dailyContent, promotionContent, newUser] = await Promise.all([
-      generateTextFromProvider({ providerId, model, system: 'You maintain knowledge files for AI assistants. Output only the file content, no explanations.', prompt: dailyMemoryPrompt }),
-      generateTextFromProvider({ providerId, model, system: 'You maintain knowledge files for AI assistants. Output only the content to append, no explanations.', prompt: promotionPrompt }),
-      generateTextFromProvider({ providerId, model, system: 'You maintain user profile documents. Output only the file content, no explanations.', prompt: userPrompt }),
+      generateTextFromProvider({ callScene: 'user_checkin', providerId, model, system: 'You maintain knowledge files for AI assistants. Output only the file content, no explanations.', prompt: dailyMemoryPrompt }),
+      generateTextFromProvider({ callScene: 'user_checkin', providerId, model, system: 'You maintain knowledge files for AI assistants. Output only the content to append, no explanations.', prompt: promotionPrompt }),
+      generateTextFromProvider({ callScene: 'user_checkin', providerId, model, system: 'You maintain user profile documents. Output only the file content, no explanations.', prompt: userPrompt }),
     ]);
 
     // Write daily memory file (episodic, per-day)

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from '@/hooks/useTranslation';
+import { isHumanOnlyTool, type SessionPermissionProfile } from '@/lib/permission/profile';
 import {
   MessageResponse,
 } from '@/components/ai-elements/message';
@@ -35,10 +36,12 @@ interface ToolUseInfo {
 
 interface PermissionPromptProps {
   pendingPermission: PermissionRequestEvent | null;
-  permissionResolved: 'allow' | 'deny' | null;
+  // 'timeout' = registry auto-denied after the 5-min window (A5 Step 2),
+  // rendered distinctly from a manual 'deny'.
+  permissionResolved: 'allow' | 'deny' | 'timeout' | null;
   onPermissionResponse: (decision: 'allow' | 'allow_session' | 'deny', updatedInput?: Record<string, unknown>, denyMessage?: string) => void;
   toolUses?: ToolUseInfo[];
-  permissionProfile?: 'default' | 'full_access';
+  permissionProfile?: SessionPermissionProfile;
 }
 
 /** Max lines to show in the tool input area before collapsing */
@@ -97,9 +100,13 @@ function AskUserQuestionUI({
     onSubmit('allow', { questions: toolInput.questions, answers });
   };
 
-  const hasAnswer = questions.some((_, i) => {
+  // Require ALL questions to be answered before enabling Submit.
+  // `some` would allow partial submissions where unanswered questions
+  // produce empty-string answers — the model would continue as if the
+  // interview completed when it actually didn't.
+  const hasAnswer = questions.length > 0 && questions.every((_, i) => {
     const qIdx = String(i);
-    return (selections[qIdx]?.size || 0) > 0 || (useOther[qIdx] && otherTexts[qIdx]?.trim());
+    return (selections[qIdx]?.size || 0) > 0 || (useOther[qIdx] && !!otherTexts[qIdx]?.trim());
   });
 
   return (
@@ -300,11 +307,11 @@ function ExitPlanModeUI({
 
       {planOpen && planContent && (
         <Dialog open={planOpen} onOpenChange={setPlanOpen}>
-          <DialogContent className="max-w-4xl h-[80vh] flex flex-col">
-            <DialogHeader>
+          <DialogContent className="max-w-4xl max-h-[85vh] flex flex-col gap-0 overflow-hidden">
+            <DialogHeader className="shrink-0">
               <DialogTitle>Plan</DialogTitle>
             </DialogHeader>
-            <div className="overflow-y-auto flex-1 min-h-0">
+            <div className="flex-1 min-h-0 overflow-y-auto mt-4">
               <MessageResponse>{planContent}</MessageResponse>
             </div>
             <DialogFooter showCloseButton />
@@ -366,7 +373,7 @@ function ToolInputDisplay({ input }: { input: Record<string, unknown> }) {
         <button
           type="button"
           onClick={() => setExpanded(!expanded)}
-          className="w-full border-t border-border/30 px-3 py-1 text-[10px] text-muted-foreground hover:bg-muted/80 transition-colors"
+          className="w-full px-3 py-1 text-[10px] text-muted-foreground hover:bg-muted/80 transition-colors"
         >
           {expanded ? '▲ Collapse' : '▼ Show more'}
         </button>
@@ -374,6 +381,22 @@ function ToolInputDisplay({ input }: { input: Record<string, unknown> }) {
     </div>
   );
 }
+
+// Tools that require user interaction even in full_access mode.
+// AskUserQuestion's entire purpose is to get user input — auto-approving
+// would return empty answers, defeating the purpose. Module-scoped so the
+// Set identity is stable across renders (was an exhaustive-deps warning).
+/**
+ * Never auto-approved in the client, whatever the profile says.
+ *
+ * Was a local hardcoded set naming only the interactive-question tool; it now
+ * defers to the shared human-only classification so this component and the
+ * server agree on the list. A client-side set that drifted from the server's
+ * would auto-click "allow" on a prompt the server raised precisely because it
+ * wanted a human.
+ */
+const isNeverAutoApproved = (toolName: string) => isHumanOnlyTool(toolName);
+
 
 export function PermissionPrompt({
   pendingPermission,
@@ -384,22 +407,34 @@ export function PermissionPrompt({
 }: PermissionPromptProps) {
   const { t } = useTranslation();
 
-  // Auto-approve when full_access is active
+  // Auto-approve when full_access is active — except for human-only tools.
+  //
+  // auto_review deliberately does NOT auto-approve here: a request that
+  // reached this prompt is one the reviewer escalated or was never allowed to
+  // see, so the answer is the user's. Auto-clicking allow for them would turn
+  // "review for me" into "full access" — the exact collapse the three-profile
+  // split exists to prevent.
   const autoApprovedRef = useRef<string | null>(null);
   useEffect(() => {
     if (
       permissionProfile === 'full_access' &&
       pendingPermission &&
       !permissionResolved &&
-      autoApprovedRef.current !== pendingPermission.permissionRequestId
+      autoApprovedRef.current !== pendingPermission.permissionRequestId &&
+      !isNeverAutoApproved(pendingPermission.toolName)
     ) {
       autoApprovedRef.current = pendingPermission.permissionRequestId;
       onPermissionResponse('allow');
     }
   }, [permissionProfile, pendingPermission, permissionResolved, onPermissionResponse]);
 
-  // Don't render permission UI when full_access
-  if (permissionProfile === 'full_access') return null;
+  // Don't render permission UI when full_access — EXCEPT for human-only tools
+  if (
+    permissionProfile === 'full_access' &&
+    (!pendingPermission || !isNeverAutoApproved(pendingPermission.toolName))
+  ) {
+    return null;
+  }
 
   // Nothing to show
   if (!pendingPermission && !permissionResolved) return null;
@@ -420,7 +455,8 @@ export function PermissionPrompt({
     if (permissionResolved === 'allow') {
       return { id: pendingPermission?.permissionRequestId || '', approved: true as const };
     }
-    if (permissionResolved === 'deny') {
+    // timeout is an auto-deny → render as not-approved, same as a manual deny.
+    if (permissionResolved === 'deny' || permissionResolved === 'timeout') {
       return { id: pendingPermission?.permissionRequestId || '', approved: false as const };
     }
     return { id: pendingPermission?.permissionRequestId || '' };
@@ -428,6 +464,16 @@ export function PermissionPrompt({
 
   return (
     <div className="mx-auto w-full max-w-3xl border-t border-border bg-background px-4 py-3 max-h-[50vh] overflow-y-auto">
+      {pendingPermission?.agentRunId && pendingPermission.agentName && !isResolved && (
+        <p
+          className="mb-2 text-xs font-medium text-muted-foreground"
+          data-subagent-permission-attribution={pendingPermission.agentRunId}
+        >
+          {t('streaming.permissionRequestedBySubagent', {
+            name: pendingPermission.agentName,
+          })}
+        </p>
+      )}
       {/* ExitPlanMode */}
       {pendingPermission?.toolName === 'ExitPlanMode' && !isResolved && (
         <ExitPlanModeUI
@@ -444,6 +490,9 @@ export function PermissionPrompt({
       {pendingPermission?.toolName === 'ExitPlanMode' && permissionResolved === 'deny' && (
         <p className="py-1 text-xs text-status-error-foreground">Plan rejected</p>
       )}
+      {pendingPermission?.toolName === 'ExitPlanMode' && permissionResolved === 'timeout' && (
+        <p className="py-1 text-xs text-status-error-foreground">{t('streaming.permissionTimedOut')}</p>
+      )}
 
       {/* AskUserQuestion */}
       {pendingPermission?.toolName === 'AskUserQuestion' && !isResolved && (
@@ -453,7 +502,12 @@ export function PermissionPrompt({
         />
       )}
       {pendingPermission?.toolName === 'AskUserQuestion' && isResolved && (
-        <p className="py-1 text-xs text-status-success-foreground">Answer submitted</p>
+        <p className={cn(
+          "py-1 text-xs",
+          permissionResolved === 'timeout' ? 'text-status-error-foreground' : 'text-status-success-foreground'
+        )}>
+          {permissionResolved === 'timeout' ? t('streaming.permissionTimedOut') : 'Answer submitted'}
+        </p>
       )}
 
       {/* Generic confirmation for other tools — only show when not yet resolved */}
@@ -514,7 +568,11 @@ export function PermissionPrompt({
           "py-1 text-xs",
           permissionResolved === 'allow' ? 'text-status-success-foreground' : 'text-status-error-foreground'
         )}>
-          {permissionResolved === 'allow' ? t('streaming.allowed') : t('streaming.denied')}
+          {permissionResolved === 'allow'
+            ? t('streaming.allowed')
+            : permissionResolved === 'timeout'
+              ? t('streaming.permissionTimedOut')
+              : t('streaming.denied')}
         </p>
       )}
     </div>

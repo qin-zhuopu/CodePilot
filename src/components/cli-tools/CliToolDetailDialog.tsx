@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Dialog,
   DialogContent,
@@ -9,9 +10,12 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Copy, ArrowSquareOut, Plus, CaretDown } from "@/components/ui/icon";
+import { ArrowSquareOut, CaretDown } from "@/components/ui/icon";
+import { CodePilotIcon } from "@/components/ui/semantic-icon";
 import { useTranslation } from "@/hooks/useTranslation";
+import type { TranslationKey } from "@/i18n";
 import type { CliToolDefinition, CliToolPlatform } from "@/types";
+import { computeAgentScore } from "./CliToolCard";
 
 interface CliToolDetailDialogProps {
   open: boolean;
@@ -32,6 +36,7 @@ export function CliToolDetailDialog({
   platform,
 }: CliToolDetailDialogProps) {
   const { t } = useTranslation();
+  const router = useRouter();
   const isZh = locale === 'zh';
   const [showMethodPicker, setShowMethodPicker] = useState(false);
 
@@ -53,12 +58,62 @@ export function CliToolDetailDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg max-h-[80vh] overflow-y-auto">
-        <DialogHeader>
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col gap-0 overflow-hidden">
+        <DialogHeader className="shrink-0">
           <DialogTitle>{tool.name}</DialogTitle>
         </DialogHeader>
 
-        <div className="flex flex-col gap-5">
+        <div className="flex-1 min-h-0 overflow-y-auto mt-4 flex flex-col gap-5">
+          {/* Agent compatibility */}
+          {(() => {
+            const score = computeAgentScore(tool);
+            if (score === 0) return null;
+            return (
+            <section>
+              <div className="flex items-center gap-2 mb-2">
+                <h3 className="text-sm font-medium">{t('cliTools.agentCompat' as TranslationKey)}</h3>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                  score >= 4 ? 'bg-primary/10 text-primary' : score >= 2 ? 'bg-muted text-foreground' : 'bg-muted text-muted-foreground'
+                }`}>
+                  {score}/5
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {tool.agentFriendly && (
+                  <span className="inline-flex items-center rounded-full bg-primary/10 px-2.5 py-1 text-xs text-primary font-medium">
+                    {t('cliTools.agentNative' as TranslationKey)}
+                  </span>
+                )}
+                {tool.supportsJson && (
+                  <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+                    JSON {t('cliTools.output' as TranslationKey)}
+                  </span>
+                )}
+                {tool.supportsSchema && (
+                  <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+                    Schema {t('cliTools.introspection' as TranslationKey)}
+                  </span>
+                )}
+                {tool.supportsDryRun && (
+                  <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+                    Dry Run
+                  </span>
+                )}
+                {tool.contextFriendly && (
+                  <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+                    {t('cliTools.contextFriendly' as TranslationKey)}
+                  </span>
+                )}
+                {tool.setupType === 'needs_auth' && (
+                  <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+                    {t('cliTools.needsAuth' as TranslationKey)}
+                  </span>
+                )}
+              </div>
+            </section>
+            );
+          })()}
+
           {/* Intro */}
           <section>
             <h3 className="text-sm font-medium mb-2">{t('cliTools.detailIntro')}</h3>
@@ -108,7 +163,7 @@ export function CliToolDetailDialog({
                         onClick={() => copyToClipboard(isZh ? ep.promptZh : ep.promptEn)}
                         title={t('cliTools.copy')}
                       >
-                        <Copy size={12} />
+                        <CodePilotIcon name="copy" size={12} aria-hidden />
                       </Button>
                     </div>
                   </div>
@@ -116,6 +171,8 @@ export function CliToolDetailDialog({
               ))}
             </div>
           </section>
+
+
 
           {/* Links */}
           {(tool.homepage || tool.repoUrl || tool.officialDocsUrl) && (
@@ -157,38 +214,56 @@ export function CliToolDetailDialog({
           )}
         </div>
 
-        {/* Install button — only for recommended (not installed) tools */}
-        {onInstall && availableMethods.length > 0 && (
-          <DialogFooter className="relative">
+        <DialogFooter className="shrink-0 border-t border-border/50 pt-3 mt-2 relative">
+          {/* "Try" button only for installed tools (no onInstall = already installed) */}
+          {!onInstall && (
             <Button
+              variant="outline"
               size="sm"
               className="gap-1.5"
-              onClick={handleInstallClick}
+              onClick={() => {
+                const prefill = isZh
+                  ? `我想用 ${tool.name} 工具完成：`
+                  : `I want to use ${tool.name} to: `;
+                window.location.href = `/chat?prefill=${encodeURIComponent(prefill)}`;
+              }}
             >
-              <Plus size={14} />
-              {t('cliTools.install')}
-              {availableMethods.length > 1 && <CaretDown size={12} />}
+              <CodePilotIcon name="play" size="sm" aria-hidden />
+              {t('cliTools.tryTool' as TranslationKey)}
             </Button>
-            {showMethodPicker && availableMethods.length > 1 && (
-              <div className="absolute right-0 bottom-10 z-10 rounded-md border bg-popover p-1 shadow-md min-w-[180px]">
-                {availableMethods.map(m => (
-                  <Button
-                    key={m.method}
-                    variant="ghost"
-                    size="sm"
-                    className="w-full justify-start px-2 py-1.5 text-xs h-auto"
-                    onClick={() => {
-                      setShowMethodPicker(false);
-                      onInstall(tool, m.method);
-                    }}
-                  >
-                    {m.method}: {m.command}
-                  </Button>
-                ))}
-              </div>
-            )}
-          </DialogFooter>
-        )}
+          )}
+          {onInstall && availableMethods.length > 0 && (
+            <>
+              <Button
+                size="sm"
+                className="gap-1.5"
+                onClick={handleInstallClick}
+              >
+                <CodePilotIcon name="plus" size="sm" aria-hidden />
+                {t('cliTools.install')}
+                {availableMethods.length > 1 && <CaretDown size={12} />}
+              </Button>
+              {showMethodPicker && availableMethods.length > 1 && (
+                <div className="absolute right-0 bottom-10 z-10 rounded-md border bg-popover p-1 shadow-md min-w-[180px]">
+                  {availableMethods.map(m => (
+                    <Button
+                      key={m.method}
+                      variant="ghost"
+                      size="sm"
+                      className="w-full justify-start px-2 py-1.5 text-xs h-auto"
+                      onClick={() => {
+                        setShowMethodPicker(false);
+                        onInstall(tool, m.method);
+                      }}
+                    >
+                      {m.method}: {m.command}
+                    </Button>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

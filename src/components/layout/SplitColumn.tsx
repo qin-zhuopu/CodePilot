@@ -6,6 +6,7 @@ import type { Message, MessagesResponse, ChatSession } from "@/types";
 import { ChatView } from "@/components/chat/ChatView";
 import { Button } from "@/components/ui/button";
 import { usePanel } from "@/hooks/usePanel";
+import { subscribeSessionTitle } from "@/lib/session-title-events";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "@/hooks/useTranslation";
 
@@ -42,11 +43,18 @@ export function SplitColumn({ sessionId, isActive, onClose, onFocus }: SplitColu
         if (cancelled) return;
         if (res.ok) {
           const data: { session: ChatSession } = await res.json();
+          if (cancelled) return;
           setSessionTitle(data.session.title || t("chat.newConversation"));
-          setSessionModel(data.session.model || "");
-          setSessionProviderId(data.session.provider_id || "");
           setProjectName(data.session.project_name || "");
           setSessionWorkingDir(data.session.working_directory || "");
+
+          // Resolve model: session → global default → provider's first → localStorage
+          const { resolveSessionModel } = await import("@/lib/resolve-session-model");
+          if (cancelled) return;
+          const resolved = await resolveSessionModel(data.session.model || "", data.session.provider_id || "");
+          if (cancelled) return;
+          setSessionModel(resolved.model);
+          setSessionProviderId(resolved.providerId);
         }
       } catch {
         // ignore
@@ -57,6 +65,13 @@ export function SplitColumn({ sessionId, isActive, onClose, onFocus }: SplitColu
     loadSession();
     return () => { cancelled = true; };
   }, [sessionId, t]);
+
+  // Same one-shot-read problem as /chat/[id]: this column reads the title once
+  // on mount, so a first message sent from inside the split view left this
+  // header (and the panel title when the column is active) stale.
+  useEffect(() => {
+    return subscribeSessionTitle(sessionId, (title) => setSessionTitle(title));
+  }, [sessionId]);
 
   // Load messages
   useEffect(() => {

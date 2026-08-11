@@ -13,6 +13,13 @@ const ALLOWED_KEYS = [
   'generative_ui_enabled',
   'locale',
   'thinking_mode',
+  'theme_mode',
+  'theme_family',
+  'default_panel',
+  'agent_runtime',
+  'cli_enabled',
+  // Feature announcement dismiss flags (persist across Electron restarts)
+  'codepilot:announcement:v0.48-agent-engine',
 ];
 
 export async function GET() {

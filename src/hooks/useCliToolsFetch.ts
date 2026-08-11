@@ -18,7 +18,6 @@ export function useCliToolsFetch(opts: {
   inputValue: string;
   locale: string;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
-  cliSearchRef: React.RefObject<HTMLInputElement | null>;
   setCliBadge: (badge: { id: string; name: string } | null) => void;
   setInputValue: (value: string) => void;
 }): UseCliToolsFetchReturn {
@@ -30,7 +29,6 @@ export function useCliToolsFetch(opts: {
     inputValue,
     locale,
     textareaRef,
-    cliSearchRef,
     setCliBadge,
     setInputValue,
   } = opts;
@@ -66,12 +64,8 @@ export function useCliToolsFetch(opts: {
         }
       } catch { /* ignore */ }
 
-      // Load cached AI descriptions
-      let autoDesc: Record<string, { zh: string; en: string }> = {};
-      try {
-        const cached = localStorage.getItem('cli-tools-auto-desc');
-        if (cached) autoDesc = JSON.parse(cached);
-      } catch { /* ignore */ }
+      // Load AI descriptions from API response (persisted in DB)
+      const autoDesc: Record<string, { zh: string; en: string }> = installedData.descriptions || {};
 
       const docLocale = document.documentElement.lang === 'zh' ? 'zh' : 'en';
       const items: CliToolItem[] = [];
@@ -102,6 +96,19 @@ export function useCliToolsFetch(opts: {
           id: ri.id,
           name: extraNames[ri.id] || ri.id,
           version: ri.version,
+          summary,
+        });
+      }
+
+      // Custom user-added tools
+      const customTools = installedData.custom || [];
+      for (const ct of customTools) {
+        const ad = autoDesc[ct.id];
+        const summary = ad ? (docLocale === 'zh' ? ad.zh : ad.en) : '';
+        items.push({
+          id: ct.id,
+          name: ct.name,
+          version: ct.version,
           summary,
         });
       }
@@ -145,10 +152,11 @@ export function useCliToolsFetch(opts: {
     setPopoverMode('cli');
     setCliFilter('');
     setSelectedIndex(0);
-    // Focus search input on next render (before fetch completes)
-    setTimeout(() => cliSearchRef.current?.focus(), 0);
+    // Re-focus the textarea so keyboard nav works immediately — there's
+    // no in-popover search input to focus any more.
+    setTimeout(() => textareaRef.current?.focus(), 0);
     fetchCliTools();
-  }, [popoverMode, closePopover, fetchCliTools, setPopoverMode, setSelectedIndex, cliSearchRef]);
+  }, [popoverMode, closePopover, fetchCliTools, setPopoverMode, setSelectedIndex, textareaRef]);
 
   return {
     cliTools,

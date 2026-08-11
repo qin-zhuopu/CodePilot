@@ -1,13 +1,15 @@
 import { streamText } from 'ai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { createAnthropic } from '@ai-sdk/anthropic';
-import { createOpenAI } from '@ai-sdk/openai';
-import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
-import { createVertexAnthropic } from '@ai-sdk/google-vertex/anthropic';
-import { resolveProvider as resolveProviderUnified, toAiSdkConfig } from './provider-resolver';
+import { createModel } from './ai-provider';
+import type { ResolvedProvider } from './provider-resolver';
+import { assertProviderCallAllowed, type ProviderCallScene } from './provider-call-policy';
+import { reportProviderFailure } from './telemetry/provider-failure';
+import { toMarkableProviderFailure } from './telemetry/provider-marker';
 
 export interface StreamTextParams {
+  callScene: ProviderCallScene;
   providerId: string;
+  /** Exact provider snapshot supplied by fail-closed background calls. */
+  resolvedProvider?: ResolvedProvider;
   model: string;
   system: string;
   prompt: string;
@@ -19,92 +21,75 @@ export interface StreamTextParams {
  * Stream text from the user's current provider.
  * Returns an async iterable of text chunks.
  *
- * Provider resolution is fully delegated to the unified resolver.
+ * Provider resolution is fully delegated to ai-provider.ts → provider-resolver.ts.
  * No fallback logic here — the resolver's chain (explicit → session → global default → env)
- * is the single source of truth, matching the Claude Code SDK path.
+ * is the single source of truth.
  *
  * NOTE: Do NOT expand model aliases (sonnet/opus/haiku) here.
  * toAiSdkConfig() resolves model IDs through the provider's availableModels catalog,
  * which uses the short alias as modelId. Expanding aliases would break that lookup
  * for SDK proxy providers (Kimi, GLM, MiniMax, etc.) that expect short aliases.
  */
+/**
+ * Pump a fullStream: yield text deltas, THROW on error parts.
+ *
+ * ai@7 的 `textStream` 对 error part 静默收尾（不抛）——上游 4xx/5xx 会变成
+ * "空文本"，调用方只能报出误导性的下游错误（tech-debt #53 实测：ClinePass
+ * 400 invalid model format 被伪装成 "Failed to extract plan JSON"）。走
+ * fullStream 并把 error part 转成异常，错误语义才是真实的。
+ * Exported for unit testing.
+ */
+export async function* pumpTextStream(
+  fullStream: AsyncIterable<{ type: string; text?: string; error?: unknown }>,
+): AsyncIterable<string> {
+  for await (const part of fullStream) {
+    if (part.type === 'text-delta' && typeof part.text === 'string') {
+      yield part.text;
+    } else if (part.type === 'error') {
+      const er = part.error as { message?: string; responseBody?: string } | undefined;
+      const body = typeof er?.responseBody === 'string' ? ` — upstream: ${er.responseBody.slice(0, 300)}` : '';
+      const failure = new Error(`${er?.message || String(part.error)}${body}`);
+      // Keep the SDK error as a non-enumerable cause so the shared telemetry
+      // normalizer can recover status/code without serializing responseBody.
+      Object.defineProperty(failure, 'cause', {
+        value: part.error,
+        enumerable: false,
+        configurable: false,
+      });
+      throw failure;
+    }
+  }
+}
+
 export async function* streamTextFromProvider(params: StreamTextParams): AsyncIterable<string> {
-  const resolved = resolveProviderUnified({ providerId: params.providerId });
-
-  if (!resolved.hasCredentials && !resolved.provider) {
-    throw new Error('No text generation provider available. Please configure a provider in Settings.');
-  }
-
-  const config = toAiSdkConfig(resolved, params.model);
-
-  // Inject process env if needed (bedrock/vertex)
-  for (const [k, v] of Object.entries(config.processEnvInjections)) {
-    process.env[k] = v;
-  }
-
-  // Build headers object for SDK clients (only if non-empty)
-  const hasHeaders = config.headers && Object.keys(config.headers).length > 0;
-
-  let model;
-  switch (config.sdkType) {
-    case 'anthropic': {
-      const anthropic = createAnthropic({
-        // apiKey and authToken are mutually exclusive in @ai-sdk/anthropic
-        ...(config.authToken
-          ? { authToken: config.authToken }
-          : { apiKey: config.apiKey }),
-        baseURL: config.baseUrl,
-        ...(hasHeaders ? { headers: config.headers } : {}),
-      });
-      model = anthropic(config.modelId);
-      break;
-    }
-    case 'openai': {
-      const openai = createOpenAI({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl,
-        ...(hasHeaders ? { headers: config.headers } : {}),
-      });
-      model = openai(config.modelId);
-      break;
-    }
-    case 'google': {
-      const google = createGoogleGenerativeAI({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl,
-        ...(hasHeaders ? { headers: config.headers } : {}),
-      });
-      model = google(config.modelId);
-      break;
-    }
-    case 'bedrock': {
-      // Auth via process.env (AWS_REGION, AWS_ACCESS_KEY_ID, etc.) — already injected above
-      const bedrock = createAmazonBedrock({
-        ...(hasHeaders ? { headers: config.headers } : {}),
-      });
-      model = bedrock(config.modelId);
-      break;
-    }
-    case 'vertex': {
-      // Anthropic-on-Vertex: auth via process.env (CLOUD_ML_REGION, GOOGLE_APPLICATION_CREDENTIALS, etc.)
-      const vertex = createVertexAnthropic({
-        ...(hasHeaders ? { headers: config.headers } : {}),
-      });
-      model = vertex(config.modelId);
-      break;
-    }
-  }
-
-  const result = streamText({
-    model: model!,
-    system: params.system,
-    prompt: params.prompt,
-    maxOutputTokens: params.maxTokens || 4096,
-    abortSignal: params.abortSignal || AbortSignal.timeout(120_000),
-  });
-
-  for await (const chunk of result.textStream) {
-    yield chunk;
+  assertProviderCallAllowed(params.resolvedProvider?.provider, params.callScene);
+  let resolvedForTelemetry = params.resolvedProvider;
+  try {
+    const { languageModel, resolved } = createModel({
+      callScene: params.callScene,
+      providerId: params.providerId,
+      resolvedProvider: params.resolvedProvider,
+      model: params.model,
+    });
+    resolvedForTelemetry = resolved;
+    const result = streamText({
+      model: languageModel,
+      // ai@7: `system` is a deprecated alias of `instructions` (wire-identical).
+      instructions: params.system,
+      prompt: params.prompt,
+      maxOutputTokens: params.maxTokens || 4096,
+      abortSignal: params.abortSignal || AbortSignal.timeout(120_000),
+    });
+    yield* pumpTextStream(result.fullStream as AsyncIterable<{ type: string; text?: string; error?: unknown }>);
+  } catch (error) {
+    const markableError = toMarkableProviderFailure(error);
+    reportProviderFailure(markableError, {
+      callScene: params.callScene,
+      resolvedProvider: resolvedForTelemetry,
+    });
+    // The reporting boundary marks this rich object before any async capture,
+    // so the Node SDK cannot auto-capture its raw provider body a second time.
+    throw markableError;
   }
 }
 

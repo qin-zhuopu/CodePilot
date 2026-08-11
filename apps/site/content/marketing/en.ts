@@ -1,5 +1,12 @@
 export interface MarketingContent {
   hero: {
+    notice?: {
+      label: string;
+      english: string;
+      chinese: string;
+      cta: string;
+      href: string;
+    };
     title: string;
     tagline: string;
     cta: string;
@@ -46,6 +53,11 @@ export interface MarketingContent {
     title: string;
     cards: { title: string; description: string; href: string }[];
   };
+  releases: {
+    title: string;
+    titleLight: string;
+    viewAll: string;
+  };
   cta: {
     title: string;
     description: string;
@@ -61,7 +73,7 @@ export interface MarketingContent {
 export const en: MarketingContent = {
   hero: {
     title: 'CodePilot',
-    tagline: 'Your desktop AI Agent for',
+    tagline: 'Your multi-model AI agent for',
     cta: 'Download',
     secondaryCta: 'Documentation',
     screenshots: [
@@ -73,8 +85,8 @@ export const en: MarketingContent = {
     ],
   },
   features: {
-    title: 'Everything you need to work with Claude Code.',
-    titleLight: 'Conversations, providers, extensions, and project context — in one place.',
+    title: 'One client for all your AI providers.',
+    titleLight: 'Conversations, 17+ providers, MCP extensions, and project context — in one place.',
     subtitle: '',
     items: [
       {
@@ -152,7 +164,7 @@ export const en: MarketingContent = {
       },
       {
         q: 'Which AI providers are supported?',
-        a: 'Anthropic, OpenAI, Google, AWS Bedrock, and any OpenAI-compatible endpoint. You can switch between them at any time.',
+        a: 'Anthropic, OpenRouter, AWS Bedrock, Google Vertex, Zhipu GLM, Kimi, Moonshot, MiniMax, Volcengine Ark, Xiaomi MiMo, Aliyun Bailian, Ollama, LiteLLM, and any Anthropic-compatible or OpenAI-compatible endpoint — 17+ providers out of the box.',
       },
       {
         q: 'Do I need a Claude Code subscription?',
@@ -163,14 +175,14 @@ export const en: MarketingContent = {
         a: 'No. All API calls go directly from your machine to the provider. CodePilot never sees your code or conversations.',
       },
       {
-        q: 'Can I use it on Windows and Linux?',
-        a: 'macOS is fully supported today. Windows and Linux builds are on the roadmap.',
+        q: 'Which platforms are supported?',
+        a: 'CodePilot ships prebuilt downloads for macOS (Apple Silicon & Intel) and Windows (x64) on the GitHub releases page. Linux (x64 & arm64) is supported by building from source.',
       },
     ],
   },
   audience: {
     title: 'Built for daily use.',
-    subtitle: 'For developers who rely on Claude Code every day.',
+    subtitle: 'For developers who work with AI every day.',
     items: [
       {
         title: 'Long-lived codebases',
@@ -195,17 +207,17 @@ export const en: MarketingContent = {
     steps: [
       {
         step: '1',
-        title: 'Install Claude Code CLI',
-        description: 'Install and sign in with your Anthropic account.',
+        title: 'Download CodePilot',
+        description: 'Available for macOS, Windows, and Linux.',
       },
       {
         step: '2',
-        title: 'Download CodePilot',
-        description: 'Configure your preferred provider.',
+        title: 'Add your AI provider',
+        description: 'Pick from 17+ presets or add a custom endpoint.',
       },
       {
         step: '3',
-        title: 'Start a session',
+        title: 'Start a conversation',
         description: 'Connect Workspace, MCP, or Bridge as needed.',
       },
     ],
@@ -220,9 +232,14 @@ export const en: MarketingContent = {
       { title: 'Workspace', description: 'File inspection and context.', href: '/docs/workspace' },
     ],
   },
+  releases: {
+    title: 'What\'s New',
+    titleLight: 'in CodePilot',
+    viewAll: 'View all releases on GitHub',
+  },
   cta: {
     title: 'Ready to try CodePilot?',
-    description: 'Download and start working with Claude Code in a desktop workspace.',
+    description: 'Download and connect your favorite AI provider in minutes.',
     primary: 'Download',
     secondary: 'Read the docs',
   },

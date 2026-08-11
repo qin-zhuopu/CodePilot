@@ -4,10 +4,14 @@ import type { ComponentProps, CSSProperties, HTMLAttributes, ReactNode } from "r
 import type {
   BundledLanguage,
   BundledTheme,
-  HighlighterGeneric,
   ThemedToken,
 } from "shiki";
-import { bundledLanguages } from "shiki";
+import { LRUMap } from "@/lib/lru-map";
+import { createHighlightEngine, type TokenizedCode } from "./shiki-highlight-core";
+import {
+  getShikiWorkerClient,
+  tokenizeWithFallback,
+} from "./shiki-worker-client";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -21,17 +25,8 @@ import { cn } from "@/lib/utils";
 import { useThemeFamily } from "@/lib/theme/context";
 import { resolveShikiTheme, resolveShikiThemes, SHIKI_DEFAULT_LIGHT, SHIKI_DEFAULT_DARK } from "@/lib/theme/code-themes";
 import type { Icon } from "@phosphor-icons/react";
-import {
-  Check,
-  Copy,
-  CaretDown,
-  CaretUp,
-  FileCode,
-  Terminal,
-  Code,
-  File,
-  Hash,
-} from "@phosphor-icons/react";
+import { Check, CaretDown, CaretUp, Hash, Terminal, Code, File, FileCode } from "@phosphor-icons/react";
+import { CodePilotIcon } from "@/components/ui/semantic-icon";
 import {
   createElement,
   createContext,
@@ -44,6 +39,8 @@ import {
   useState,
 } from "react";
 import { createHighlighter } from "shiki";
+import { usePanel } from "@/hooks/usePanel";
+import type { PreviewSource } from "@/hooks/usePanel";
 
 // ── Collapse/expand constants ──────────────────────────────────────────
 const COLLAPSE_THRESHOLD = 20;
@@ -96,18 +93,20 @@ const addKeysToTokens = (lines: ThemedToken[][]): KeyedLine[] =>
   }));
 
 // Token rendering component
-const TokenSpan = ({ token }: { token: ThemedToken }) => (
+const TokenSpan = ({ token, stripColors }: { token: ThemedToken; stripColors?: boolean }) => (
   <span
-    className="dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]"
+    className={stripColors ? undefined : "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]"}
     style={
-      {
-        backgroundColor: token.bgColor,
-        color: token.color,
-        fontStyle: isItalic(token.fontStyle) ? "italic" : undefined,
-        fontWeight: isBold(token.fontStyle) ? "bold" : undefined,
-        textDecoration: isUnderline(token.fontStyle) ? "underline" : undefined,
-        ...token.htmlStyle,
-      } as CSSProperties
+      stripColors
+        ? { color: "inherit" }
+        : {
+            backgroundColor: token.bgColor,
+            color: token.color,
+            fontStyle: isItalic(token.fontStyle) ? "italic" : undefined,
+            fontWeight: isBold(token.fontStyle) ? "bold" : undefined,
+            textDecoration: isUnderline(token.fontStyle) ? "underline" : undefined,
+            ...token.htmlStyle,
+          } as CSSProperties
     }
   >
     {token.content}
@@ -118,15 +117,17 @@ const TokenSpan = ({ token }: { token: ThemedToken }) => (
 const LineSpan = ({
   keyedLine,
   showLineNumbers,
+  stripColors,
 }: {
   keyedLine: KeyedLine;
   showLineNumbers: boolean;
+  stripColors?: boolean;
 }) => (
   <span className={showLineNumbers ? LINE_NUMBER_CLASSES : "block"}>
     {keyedLine.tokens.length === 0
       ? "\n"
       : keyedLine.tokens.map(({ token, key }) => (
-          <TokenSpan key={key} token={token} />
+          <TokenSpan key={key} token={token} stripColors={stripColors} />
         ))}
   </span>
 );
@@ -139,12 +140,6 @@ type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   filename?: string;
 };
 
-interface TokenizedCode {
-  tokens: ThemedToken[][];
-  fg: string;
-  bg: string;
-}
-
 interface CodeBlockContextType {
   code: string;
   language: string;
@@ -156,14 +151,8 @@ const CodeBlockContext = createContext<CodeBlockContextType>({
   language: "text",
 });
 
-// Highlighter cache keyed by "lang:lightTheme:darkTheme"
-const highlighterCache = new Map<
-  string,
-  Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
->();
-
-// Token cache
-const tokensCache = new Map<string, TokenizedCode>();
+// Token cache — bounded to 200 entries
+const tokensCache = new LRUMap<string, TokenizedCode>(200);
 
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
@@ -174,41 +163,20 @@ const getTokensCacheKey = (code: string, language: BundledLanguage, lightTheme: 
   return `${language}:${lightTheme}:${darkTheme}:${code.length}:${start}:${end}`;
 };
 
-const isBundledLanguage = (lang: string): lang is BundledLanguage =>
-  lang in bundledLanguages || lang === "text" || lang === "plaintext";
-
-const getHighlighter = (
-  language: BundledLanguage,
-  lightTheme: BundledTheme = SHIKI_DEFAULT_LIGHT,
-  darkTheme: BundledTheme = SHIKI_DEFAULT_DARK,
-): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
-  // Normalize unknown languages to "text" before hitting Shiki
-  const safeLang = isBundledLanguage(language) ? language : ("text" as BundledLanguage);
-  const cacheKey = `${safeLang}:${lightTheme}:${darkTheme}`;
-
-  const cached = highlighterCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const highlighterPromise = createHighlighter({
-    langs: [safeLang],
-    themes: [lightTheme, darkTheme],
-  }).catch(() => {
-    // Language or theme not supported — fall back to plain text + default themes.
-    // Using default themes avoids infinite retry if the *theme* was the problem.
-    highlighterCache.delete(cacheKey);
-    const useFallbackThemes =
-      lightTheme !== SHIKI_DEFAULT_LIGHT || darkTheme !== SHIKI_DEFAULT_DARK;
-    if (useFallbackThemes) {
-      return getHighlighter("text" as BundledLanguage, SHIKI_DEFAULT_LIGHT, SHIKI_DEFAULT_DARK);
-    }
-    return getHighlighter("text" as BundledLanguage, lightTheme, darkTheme);
-  });
-
-  highlighterCache.set(cacheKey, highlighterPromise);
-  return highlighterPromise;
-};
+/**
+ * Phase 5B — main-thread FALLBACK tokenizer. The happy path runs this exact
+ * engine inside the Shiki Web Worker (shiki.worker.ts); this instance only
+ * runs when the worker is unavailable or a tokenize RPC fails, so
+ * `createHighlighter` / `codeToTokens` no longer execute on the main thread on
+ * the hot path. Its highlighter cache stays empty until a fallback happens.
+ */
+const fallbackEngine = createHighlightEngine({
+  createHighlighter,
+  loadBundledLanguages: async () =>
+    (await import("shiki")).bundledLanguages as Record<string, unknown>,
+  defaultLight: SHIKI_DEFAULT_LIGHT,
+  defaultDark: SHIKI_DEFAULT_DARK,
+});
 
 // Create raw tokens for immediate display while highlighting loads
 const createRawTokens = (code: string): TokenizedCode => ({
@@ -225,6 +193,77 @@ const createRawTokens = (code: string): TokenizedCode => ({
         ]
   ),
 });
+
+/**
+ * Shim TokenizedCode (this file's internal shape) → Shiki's TokensResult
+ * (the shape @streamdown/code's CodeHighlighterPlugin expects). Fills the
+ * two optional metadata fields Streamdown's renderer reads when present:
+ * themeName (used as a class hint on <pre>) and rootStyle (used as inline
+ * styles for background/foreground on the wrapper). Phase 5.5.
+ */
+function toTokensResult(
+  tokenized: TokenizedCode,
+  darkTheme: BundledTheme,
+): {
+  tokens: ThemedToken[][];
+  bg: string;
+  fg: string;
+  themeName: string;
+  rootStyle: string;
+} {
+  return {
+    ...tokenized,
+    themeName: String(darkTheme),
+    rootStyle: `background-color:${tokenized.bg};color:${tokenized.fg}`,
+  };
+}
+
+/**
+ * Create a Streamdown-compatible CodeHighlighterPlugin that routes through
+ * this file's highlightCode(). Sharing the LRU + Shiki highlighter pool
+ * with CodeBlockContent means chat messages and file previews don't each
+ * spin up their own unbounded caches — Phase 0.2 POC showed @streamdown/
+ * code's default plugin maintains its own unbounded module-level Map,
+ * which long chat sessions can grow without limit.
+ *
+ * Shape matches @streamdown/code/dist/index.d.ts's CodeHighlighterPlugin.
+ * themes prop is the [light, dark] pair; when null/undefined the caller
+ * gets SHIKI_DEFAULT_LIGHT / SHIKI_DEFAULT_DARK.
+ */
+export function createSharedCodePlugin(options?: {
+  themes?: [BundledTheme, BundledTheme];
+}): {
+  name: "shiki";
+  type: "code-highlighter";
+  highlight: (
+    params: { code: string; language: BundledLanguage; themes: [string, string] },
+    callback?: (result: ReturnType<typeof toTokensResult>) => void,
+  ) => ReturnType<typeof toTokensResult> | null;
+  supportsLanguage: (language: BundledLanguage) => boolean;
+  getSupportedLanguages: () => BundledLanguage[];
+  getThemes: () => [BundledTheme, BundledTheme];
+} {
+  const [defaultLight, defaultDark] = options?.themes ?? [SHIKI_DEFAULT_LIGHT, SHIKI_DEFAULT_DARK];
+  return {
+    name: "shiki" as const,
+    type: "code-highlighter" as const,
+    highlight(params, callback) {
+      const light = (params.themes[0] as BundledTheme) ?? defaultLight;
+      const dark = (params.themes[1] as BundledTheme) ?? defaultDark;
+      const tokenized = highlightCode(
+        params.code,
+        params.language,
+        callback ? (result) => callback(toTokensResult(result, dark)) : undefined,
+        light,
+        dark,
+      );
+      return tokenized ? toTokensResult(tokenized, dark) : null;
+    },
+    supportsLanguage: () => true,
+    getSupportedLanguages: () => [] as BundledLanguage[],
+    getThemes: () => [defaultLight, defaultDark],
+  };
+}
 
 // Synchronous highlight with callback for async results
 export const highlightCode = (
@@ -251,27 +290,17 @@ export const highlightCode = (
     subscribers.get(tokensCacheKey)?.add(callback);
   }
 
-  // Start highlighting in background - fire-and-forget async pattern
-  getHighlighter(language, lightTheme, darkTheme)
+  // Start highlighting in the background — fire-and-forget. Phase 5B: route
+  // tokenization to the Shiki Web Worker off the main thread; on any worker
+  // failure fall back to the identical main-thread engine so a code block is
+  // never left blank.
+  tokenizeWithFallback(
+    { code, language, lightTheme, darkTheme },
+    getShikiWorkerClient(),
+    fallbackEngine.tokenize,
+  )
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
-    .then((highlighter) => {
-      const availableLangs = highlighter.getLoadedLanguages();
-      const langToUse = availableLangs.includes(language) ? language : "text";
-
-      const result = highlighter.codeToTokens(code, {
-        lang: langToUse,
-        themes: {
-          dark: darkTheme,
-          light: lightTheme,
-        },
-      });
-
-      const tokenized: TokenizedCode = {
-        bg: result.bg ?? "transparent",
-        fg: result.fg ?? "inherit",
-        tokens: result.tokens,
-      };
-
+    .then((tokenized) => {
       // Cache the result
       tokensCache.set(tokensCacheKey, tokenized);
 
@@ -312,17 +341,18 @@ const CodeBlockBody = memo(
     tokenized,
     showLineNumbers,
     className,
+    isTerminal,
   }: {
     tokenized: TokenizedCode;
     showLineNumbers: boolean;
     className?: string;
+    isTerminal?: boolean;
   }) => {
     const preStyle = useMemo(
-      () => ({
-        backgroundColor: tokenized.bg,
-        color: tokenized.fg,
-      }),
-      [tokenized.bg, tokenized.fg]
+      () => isTerminal
+        ? {} // Terminal uses CSS variables, no inline Shiki colors
+        : { backgroundColor: tokenized.bg, color: tokenized.fg },
+      [tokenized.bg, tokenized.fg, isTerminal]
     );
 
     const keyedLines = useMemo(
@@ -333,7 +363,10 @@ const CodeBlockBody = memo(
     return (
       <pre
         className={cn(
-          "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)] m-0 p-4 text-sm",
+          "m-0 p-4 text-sm",
+          isTerminal
+            ? "!bg-[var(--terminal-bg)] !text-[var(--terminal-foreground)]"
+            : "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]",
           className
         )}
         style={preStyle}
@@ -349,6 +382,7 @@ const CodeBlockBody = memo(
               key={keyedLine.key}
               keyedLine={keyedLine}
               showLineNumbers={showLineNumbers}
+              stripColors={isTerminal}
             />
           ))}
         </code>
@@ -358,7 +392,8 @@ const CodeBlockBody = memo(
   (prevProps, nextProps) =>
     prevProps.tokenized === nextProps.tokenized &&
     prevProps.showLineNumbers === nextProps.showLineNumbers &&
-    prevProps.className === nextProps.className
+    prevProps.className === nextProps.className &&
+    prevProps.isTerminal === nextProps.isTerminal
 );
 
 CodeBlockBody.displayName = "CodeBlockBody";
@@ -538,7 +573,7 @@ export const CodeBlockContent = ({
         }}
       >
         <div className="relative overflow-auto">
-          <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} />
+          <CodeBlockBody showLineNumbers={showLineNumbers} tokenized={tokenized} isTerminal={isTerminal} />
         </div>
 
         {/* Gradient overlay for collapsed state */}
@@ -546,7 +581,7 @@ export const CodeBlockContent = ({
           <div className={cn(
             "absolute bottom-0 left-0 right-0 h-16 pointer-events-none",
             isTerminal
-              ? "bg-gradient-to-t from-[#0a0a0a] to-transparent"
+              ? "bg-gradient-to-t from-[var(--terminal-gradient-from)] to-transparent"
               : "bg-gradient-to-t from-muted to-transparent"
           )} />
         )}
@@ -560,7 +595,7 @@ export const CodeBlockContent = ({
           className={cn(
             "flex w-full items-center justify-center gap-1.5 py-1.5 text-xs transition-colors",
             isTerminal
-              ? "bg-zinc-950 text-zinc-400 hover:text-zinc-200"
+              ? "bg-[var(--terminal-bg)] text-[var(--terminal-muted)] hover:text-[var(--terminal-foreground)]"
               : "bg-muted text-muted-foreground hover:text-foreground"
           )}
         >
@@ -602,7 +637,7 @@ export const CodeBlock = ({
       <CodeBlockContainer
         className={cn(
           hasCustomChildren ? undefined : "not-prose my-3",
-          isTerminal && !hasCustomChildren && "border-zinc-700/50",
+          isTerminal && !hasCustomChildren && "border-[var(--terminal-border)]",
           className,
         )}
         language={language}
@@ -669,36 +704,46 @@ const CodeBlockDefaultHeader = ({
     <div className={cn(
       "flex items-center justify-between px-4 py-1.5 text-xs border-b",
       isTerminal
-        ? "bg-zinc-950 text-zinc-400"
+        ? "bg-[var(--terminal-bg)] text-[var(--terminal-muted)]"
         : "bg-muted text-muted-foreground"
     )}>
       <div className="flex items-center gap-2 min-w-0">
         {createElement(langIcon, { size: 14, className: cn(
           "shrink-0",
-          isTerminal ? "text-green-400" : "text-muted-foreground",
+          isTerminal ? "text-[var(--terminal-accent)]" : "text-muted-foreground",
         ) })}
         {filename && (
           <span className={cn(
             "truncate font-medium",
-            isTerminal ? "text-zinc-300" : "text-foreground"
+            isTerminal ? "text-[var(--terminal-foreground)]" : "text-foreground"
           )}>{filename}</span>
         )}
         {filename && <span className="text-muted-foreground/50">|</span>}
         <span className={cn(
           "rounded px-1.5 py-0.5",
           isTerminal
-            ? "bg-zinc-700/50 text-green-400"
+            ? "bg-[var(--terminal-hover-bg)] text-[var(--terminal-accent)]"
             : "bg-accent text-accent-foreground"
         )}>{language.toUpperCase()}</span>
       </div>
       <div className="flex items-center gap-1 ml-2 shrink-0">
+        {/* Phase 4.B — Open in Artifact action. Shown only for languages
+            that have a configured preview renderer. The code itself
+            doesn't go through any file scope; it's an inline-* source
+            so the trust-tier pipeline is bypassed (the code is already
+            in the chat). HTML in particular uses inline-html → strict
+            sandbox (no relative resources, no scripts) because we
+            don't have a file scope to authorize. The code-fence
+            Preview is for inspecting the *content*, not for running
+            it as a real page. */}
+        <CodeFencePreviewButton language={contextLanguage} code={contextCode} />
         <button
           onClick={handleCopy}
           type="button"
           className={cn(
             "flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors",
             isTerminal
-              ? "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50"
+              ? "text-[var(--terminal-muted)] hover:text-[var(--terminal-foreground)] hover:bg-[var(--terminal-hover-bg)]"
               : "text-muted-foreground hover:text-foreground hover:bg-accent"
           )}
           title="Copy code"
@@ -710,7 +755,7 @@ const CodeBlockDefaultHeader = ({
             </>
           ) : (
             <>
-              <Copy size={12} />
+              <CodePilotIcon name="copy" size={12} aria-hidden />
               <span>Copy</span>
             </>
           )}
@@ -721,7 +766,7 @@ const CodeBlockDefaultHeader = ({
           className={cn(
             "flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors",
             isTerminal
-              ? "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50"
+              ? "text-[var(--terminal-muted)] hover:text-[var(--terminal-foreground)] hover:bg-[var(--terminal-hover-bg)]"
               : "text-muted-foreground hover:text-foreground hover:bg-accent"
           )}
           title="Copy as Markdown"
@@ -733,7 +778,7 @@ const CodeBlockDefaultHeader = ({
             </>
           ) : (
             <>
-              <FileCode size={12} />
+              <CodePilotIcon name="file_code" size={12} aria-hidden />
               <span>Markdown</span>
             </>
           )}
@@ -742,6 +787,130 @@ const CodeBlockDefaultHeader = ({
     </div>
   );
 };
+
+/**
+ * Phase 4.B — code-fence "Preview" button. Surfaces only when the
+ * fence's language is one we have a renderer for. The button uses
+ * usePanel (rather than dispatching a window event) so the React
+ * state update flows through AppShell's setPreviewSource — same path
+ * as the file-tree click and DiffSummary card.
+ *
+ * Mapping table:
+ *   html / xml         → inline-html  (strict sandbox; no file scope)
+ *   jsx / tsx          → inline-jsx   (Sandpack)
+ *   json               → inline-json  (tree viewer)
+ *   diff / patch       → inline-diff
+ *   csv                → inline-datatable (papaparse)
+ *   tsv                → inline-datatable (tab-delimited)
+ *   markdown / md / mdx→ inline-markdown
+ *
+ * Other languages render no button — the existing Copy / Markdown
+ * actions are sufficient for code that has no rendered preview form.
+ */
+function CodeFencePreviewButton({
+  language,
+  code,
+}: {
+  language: string;
+  code: string;
+}) {
+  const panel = usePanelOrNull();
+  const source = useMemo(() => previewSourceForCodeFence(language, code), [language, code]);
+  if (!source) return null;
+  if (!panel) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => panel.setPreviewSource(source)}
+      data-codepilot-codefence-preview={language}
+      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+      title={`Open this ${language} in the Artifact preview`}
+    >
+      <CodePilotIcon name="file_code" size={12} aria-hidden />
+      <span>Preview</span>
+    </button>
+  );
+}
+
+/**
+ * usePanel() throws when used outside the PanelContext provider, but
+ * the CodeBlock component is also used in places without a panel
+ * (e.g. the design-system gallery). Wrapping in a safe variant lets
+ * the Preview button gracefully disappear instead of crashing the
+ * surrounding render.
+ */
+function usePanelOrNull() {
+  try {
+    return usePanel();
+  } catch {
+    return null;
+  }
+}
+
+export function previewSourceForCodeFence(
+  language: string,
+  code: string,
+): PreviewSource | null {
+  const lang = language.toLowerCase();
+  switch (lang) {
+    case "html":
+    case "xml":
+      return { kind: "inline-html", html: code, virtualName: "fence.html" };
+    case "jsx":
+      return { kind: "inline-jsx", jsx: code, virtualName: "fence.jsx" };
+    case "tsx":
+      return { kind: "inline-jsx", jsx: code, virtualName: "fence.tsx" };
+    case "json":
+      return { kind: "inline-json", text: code, virtualName: "fence.json" };
+    case "diff":
+    case "patch":
+      return { kind: "inline-diff", diff: code, virtualName: "fence.diff" };
+    case "csv":
+      return parseCsvForFence(code, ",", "fence.csv");
+    case "tsv":
+      return parseCsvForFence(code, "\t", "fence.tsv");
+    case "markdown":
+    case "md":
+    case "mdx":
+      return {
+        kind: "inline-markdown",
+        markdown: code,
+        virtualName: "fence.md",
+      };
+    default:
+      return null;
+  }
+}
+
+function parseCsvForFence(
+  text: string,
+  delim: string,
+  virtualName: string,
+): PreviewSource {
+  // Light CSV parser — good enough for chat-pasted tables. We don't
+  // pull papaparse here because the existing DataTableViewer reads
+  // raw csv text in its csv= prop; we hand it the same. For the
+  // PreviewSource we still produce inline-datatable shape with
+  // rows / header so the panel's existing dispatch path applies.
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
+  if (lines.length === 0) {
+    return {
+      kind: "inline-datatable",
+      header: [],
+      rows: [],
+      virtualName,
+    };
+  }
+  const split = (l: string) => l.split(delim).map((c) => c.trim());
+  const header = split(lines[0]);
+  const rows = lines.slice(1).map(split);
+  return {
+    kind: "inline-datatable",
+    header,
+    rows,
+    virtualName,
+  };
+}
 
 export type CodeBlockCopyButtonProps = ComponentProps<typeof Button> & {
   onCopy?: () => void;
@@ -789,8 +958,6 @@ export const CodeBlockCopyButton = ({
     []
   );
 
-  const Icon = isCopied ? Check : Copy;
-
   return (
     <Button
       className={cn("shrink-0", className)}
@@ -799,7 +966,7 @@ export const CodeBlockCopyButton = ({
       variant="ghost"
       {...props}
     >
-      {children ?? <Icon size={14} />}
+      {children ?? (isCopied ? <Check size={14} /> : <CodePilotIcon name="copy" size="sm" aria-hidden />)}
     </Button>
   );
 };

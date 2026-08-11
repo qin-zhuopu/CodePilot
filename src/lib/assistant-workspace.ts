@@ -1,22 +1,29 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import type { AssistantWorkspaceState, AssistantWorkspaceFiles, AssistantWorkspaceFilesV2, SearchResult } from '@/types';
 import { getLocalDateString } from '@/lib/utils';
+import { HEARTBEAT_TEMPLATE, isWithinActiveHours } from './heartbeat';
+import { inferTaxonomyFromDirs, loadTaxonomy, saveTaxonomy } from '@/lib/workspace-taxonomy';
 
 const DEFAULT_STATE: AssistantWorkspaceState = {
   onboardingComplete: false,
-  lastCheckInDate: null,
-  schemaVersion: 4,
-  dailyCheckInEnabled: false,
+  lastHeartbeatDate: null,
+  heartbeatEnabled: false,
+  schemaVersion: 5,
 };
 
 const STATE_DIR = '.assistant';
 const STATE_FILE = 'state.json';
 const MEMORY_DAILY_DIR = 'memory/daily';
+const CANONICAL_INSTRUCTIONS_FILE = 'instructions.md';
+const NATIVE_INSTRUCTION_MIRRORS = ['CLAUDE.md', 'AGENTS.md'] as const;
+const MANAGED_MIRROR_HEADER = /^<!-- codepilot-managed-instructions\r?\nsource: instructions\.md\r?\ncontent-sha256: ([a-f0-9]{64})\r?\n-->\r?\n/;
 
-// Canonical filenames — lowercase preferred, uppercase fallback
+// Canonical filenames — neutral instructions.md for new workspaces, with
+// legacy Claude/Agent-specific names kept as read-compatible fallbacks.
 const FILE_MAP: Record<keyof AssistantWorkspaceFiles, string[]> = {
-  claude: ['claude.md', 'Claude.md', 'CLAUDE.md', 'AGENTS.md'],
+  claude: [CANONICAL_INSTRUCTIONS_FILE, 'claude.md', 'Claude.md', 'CLAUDE.md', 'AGENTS.md'],
   soul: ['soul.md', 'Soul.md', 'SOUL.md'],
   user: ['user.md', 'User.md', 'USER.md', 'PROFILE.md'],
   memory: ['memory.md', 'Memory.md', 'MEMORY.md'],
@@ -24,7 +31,7 @@ const FILE_MAP: Record<keyof AssistantWorkspaceFiles, string[]> = {
 
 // Templates for initialization
 const FILE_TEMPLATES: Record<keyof AssistantWorkspaceFiles, string> = {
-  claude: '# Rules\n\n<!-- Assistant execution rules go here -->\n',
+  claude: '# Rules\n\n## Time Awareness\n任何涉及时间的场景，先用 date 命令确认当前时间，不要凭记忆猜测。\n\n## Memory Rules\n- 用户说"记一下"或"记住"：保留原文存笔记，不添加 TODO，不"发挥"，不改写\n- 重要决策和稳定偏好 → 写入 memory.md（追加，不覆写）\n- 日常工作记录 → 写入 memory/daily/{日期}.md\n- 修改 soul.md / user.md / instructions.md → 必须告知用户\n\n## Document Organization\n- 双向链接：使用 [[文件名]] 创建文档之间的链接\n- 反向链接：追踪哪些文档引用了当前文档\n- 标签系统：使用 #标签 进行分类和检索\n- 属性标记：在文档顶部使用 YAML frontmatter 添加元数据\n- 少用文件夹层级，多用标签和链接做组织\n\n## Writing Constraints\n- 不使用空泛修饰词（核心能力、关键、彰显、赋能、驱动…）\n- 不使用"不是...而是..."对比句式，除非用户要求\n- 输出内容以实用为主，不添加不必要的修饰\n\n## Safety\n- 修改身份文件（soul/user/instructions.md）后必须通知用户具体改了什么\n- memory.md 只追加，不覆写已有内容\n- 不在记忆文件中存储密码、API key 等敏感信息\n',
   soul: '# Soul\n\n<!-- Assistant personality and style go here -->\n',
   user: '# User Profile\n\n<!-- User preferences and information go here -->\n',
   memory: '# Memory\n\n<!-- Long-term facts and notes go here -->\n',
@@ -34,10 +41,6 @@ const PER_FILE_LIMIT = 8000;
 const HEAD_SIZE = 6000;
 const TAIL_SIZE = 1800;
 const TOTAL_PROMPT_LIMIT = 40000;
-const DAILY_MEMORY_LIMIT = 4000;
-const ROOT_DOC_LIMIT = 2000;
-const RETRIEVAL_RESULT_LIMIT = 3000;
-const MAX_RETRIEVAL_RESULTS = 5;
 
 function resolveFile(dir: string, key: keyof AssistantWorkspaceFiles): { filePath: string; exists: boolean } {
   for (const variant of FILE_MAP[key]) {
@@ -47,6 +50,173 @@ function resolveFile(dir: string, key: keyof AssistantWorkspaceFiles): { filePat
     }
   }
   return { filePath: path.join(dir, FILE_MAP[key][0]), exists: false };
+}
+
+export type InstructionMirrorStatus = 'missing' | 'synced' | 'stale' | 'modified' | 'unmanaged';
+
+export interface InstructionMirrorInspection {
+  fileName: (typeof NATIVE_INSTRUCTION_MIRRORS)[number];
+  status: InstructionMirrorStatus;
+}
+
+export interface InstructionMirrorsInspection {
+  canonicalExists: boolean;
+  mirrors: InstructionMirrorInspection[];
+  conflicts: string[];
+}
+
+export interface InstructionMirrorsReconcileResult extends InstructionMirrorsInspection {
+  created: string[];
+  updated: string[];
+}
+
+function normalizeInstructionLineEndings(content: string): string {
+  return content.replace(/\r\n/g, '\n');
+}
+
+function instructionHash(content: string): string {
+  return crypto.createHash('sha256').update(normalizeInstructionLineEndings(content), 'utf8').digest('hex');
+}
+
+function renderManagedInstructionMirror(content: string): string {
+  return [
+    '<!-- codepilot-managed-instructions',
+    `source: ${CANONICAL_INSTRUCTIONS_FILE}`,
+    `content-sha256: ${instructionHash(content)}`,
+    '-->',
+    content,
+  ].join('\n');
+}
+
+function sameFile(left: string, right: string): boolean {
+  try {
+    const leftStat = fs.statSync(left);
+    const rightStat = fs.statSync(right);
+    return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+  } catch {
+    return false;
+  }
+}
+
+function inspectInstructionMirror(
+  dir: string,
+  fileName: (typeof NATIVE_INSTRUCTION_MIRRORS)[number],
+  canonicalContent: string,
+): InstructionMirrorInspection {
+  const canonicalPath = path.join(dir, CANONICAL_INSTRUCTIONS_FILE);
+  const mirrorPath = path.join(dir, fileName);
+  if (!fs.existsSync(mirrorPath)) {
+    return { fileName, status: 'missing' };
+  }
+  if (sameFile(canonicalPath, mirrorPath)) {
+    return { fileName, status: 'synced' };
+  }
+  try {
+    // A link to the canonical file is accepted above. Any other symlink is
+    // user-owned topology; never replace the link merely because its current
+    // target happens to contain a managed-looking header.
+    if (fs.lstatSync(mirrorPath).isSymbolicLink()) {
+      return { fileName, status: 'unmanaged' };
+    }
+  } catch {
+    return { fileName, status: 'unmanaged' };
+  }
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(mirrorPath, 'utf8');
+  } catch {
+    return { fileName, status: 'unmanaged' };
+  }
+  const header = raw.match(MANAGED_MIRROR_HEADER);
+  if (!header) {
+    return { fileName, status: 'unmanaged' };
+  }
+  const body = raw.slice(header[0].length);
+  const recordedHash = header[1];
+  if (instructionHash(body) !== recordedHash) {
+    return { fileName, status: 'modified' };
+  }
+  return {
+    fileName,
+    status: instructionHash(canonicalContent) === recordedHash ? 'synced' : 'stale',
+  };
+}
+
+/** Read-only status used by Settings and Runtime ownership gates. */
+export function inspectInstructionMirrors(dir: string): InstructionMirrorsInspection {
+  const canonicalPath = path.join(dir, CANONICAL_INSTRUCTIONS_FILE);
+  if (!fs.existsSync(canonicalPath)) {
+    return {
+      canonicalExists: false,
+      mirrors: NATIVE_INSTRUCTION_MIRRORS.map((fileName) => ({
+        fileName,
+        status: fs.existsSync(path.join(dir, fileName)) ? 'unmanaged' : 'missing',
+      })),
+      // A legacy workspace without instructions.md remains valid and no-touch.
+      conflicts: [],
+    };
+  }
+
+  const canonicalContent = fs.readFileSync(canonicalPath, 'utf8');
+  const mirrors = NATIVE_INSTRUCTION_MIRRORS.map((fileName) =>
+    inspectInstructionMirror(dir, fileName, canonicalContent));
+  return {
+    canonicalExists: true,
+    mirrors,
+    conflicts: mirrors
+      .filter((mirror) => mirror.status === 'modified' || mirror.status === 'unmanaged')
+      .map((mirror) => mirror.fileName),
+  };
+}
+
+function atomicWriteManagedMirror(targetPath: string, content: string): void {
+  const tempPath = `${targetPath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  try {
+    fs.writeFileSync(tempPath, content, 'utf8');
+    fs.renameSync(tempPath, targetPath);
+  } finally {
+    try { fs.unlinkSync(tempPath); } catch { /* already renamed or never created */ }
+  }
+}
+
+/**
+ * Keep framework-native entry files aligned with the neutral truth source.
+ * Any unmanaged or manually edited mirror freezes the whole pair so CodePilot
+ * never overwrites user-authored rules or leaves Claude/Codex on two versions.
+ */
+export function reconcileInstructionMirrors(dir: string): InstructionMirrorsReconcileResult {
+  const before = inspectInstructionMirrors(dir);
+  const created: string[] = [];
+  const updated: string[] = [];
+  if (!before.canonicalExists || before.conflicts.length > 0) {
+    return { ...before, created, updated };
+  }
+
+  const canonicalContent = fs.readFileSync(path.join(dir, CANONICAL_INSTRUCTIONS_FILE), 'utf8');
+  const rendered = renderManagedInstructionMirror(canonicalContent);
+  for (const mirror of before.mirrors) {
+    if (mirror.status !== 'missing' && mirror.status !== 'stale') continue;
+    const targetPath = path.join(dir, mirror.fileName);
+    // Re-check immediately before the write. A concurrently created or edited
+    // file becomes a conflict on the next inspection instead of being replaced.
+    const current = inspectInstructionMirror(dir, mirror.fileName, canonicalContent);
+    if (current.status !== mirror.status) continue;
+    if (mirror.status === 'missing') {
+      try {
+        fs.writeFileSync(targetPath, rendered, { encoding: 'utf8', flag: 'wx' });
+        created.push(targetPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    } else {
+      atomicWriteManagedMirror(targetPath, rendered);
+      updated.push(targetPath);
+    }
+  }
+
+  const after = inspectInstructionMirrors(dir);
+  return { ...after, created, updated };
 }
 
 // ==========================================
@@ -180,6 +350,45 @@ export function migrateStateV3ToV4(dir: string): void {
 
   state.dailyCheckInEnabled = false;
   state.schemaVersion = 4;
+  saveState(dir, state);
+}
+
+/**
+ * v4→v5 migration: rename check-in fields to heartbeat fields.
+ * lastCheckInDate → lastHeartbeatDate, dailyCheckInEnabled → heartbeatEnabled.
+ */
+function migrateStateV4ToV5(dir: string): void {
+  let state: AssistantWorkspaceState;
+  try {
+    const statePath = path.join(dir, STATE_DIR, STATE_FILE);
+    const fileContent = fs.readFileSync(statePath, 'utf-8');
+    state = JSON.parse(fileContent) as AssistantWorkspaceState;
+  } catch {
+    return;
+  }
+
+  if (state.schemaVersion >= 5) return;
+
+  // Work with raw parsed object to safely rename fields across schema versions
+  const raw = state as unknown as Record<string, unknown>;
+
+  // Rename lastCheckInDate → lastHeartbeatDate
+  if ('lastCheckInDate' in raw && !('lastHeartbeatDate' in raw)) {
+    raw.lastHeartbeatDate = raw.lastCheckInDate ?? null;
+  }
+  if (!('lastHeartbeatDate' in raw)) {
+    raw.lastHeartbeatDate = null;
+  }
+
+  // Rename dailyCheckInEnabled → heartbeatEnabled
+  if ('dailyCheckInEnabled' in raw && !('heartbeatEnabled' in raw)) {
+    raw.heartbeatEnabled = raw.dailyCheckInEnabled ?? false;
+  }
+  if (!('heartbeatEnabled' in raw)) {
+    raw.heartbeatEnabled = false;
+  }
+
+  state.schemaVersion = 5;
   saveState(dir, state);
 }
 
@@ -324,11 +533,30 @@ export function initializeWorkspace(dir: string): string[] {
     }
   }
 
+  // A fresh neutral workspace also exposes native discovery files for Claude
+  // Code and Codex. Existing legacy workspaces have no instructions.md and
+  // therefore remain strictly no-touch. Managed mirrors update only while
+  // their provenance hash proves the user has not edited them independently.
+  const mirrorResult = reconcileInstructionMirrors(dir);
+  created.push(...mirrorResult.created);
+  if (mirrorResult.conflicts.length > 0) {
+    console.warn('[assistant-workspace] Instruction mirror conflict; auto-sync paused', {
+      files: mirrorResult.conflicts,
+    });
+  }
+
   // Create V2 directories
   ensureDailyDir(dir);
   const inboxDir = path.join(dir, 'Inbox');
   if (!fs.existsSync(inboxDir)) {
     fs.mkdirSync(inboxDir, { recursive: true });
+  }
+
+  // Create HEARTBEAT.md if not exists (V3)
+  const heartbeatPath = path.join(dir, 'HEARTBEAT.md');
+  if (!fs.existsSync(heartbeatPath)) {
+    fs.writeFileSync(heartbeatPath, HEARTBEAT_TEMPLATE, 'utf-8');
+    created.push(heartbeatPath);
   }
 
   // State file
@@ -340,14 +568,17 @@ export function initializeWorkspace(dir: string): string[] {
     migrateStateV1ToV2(dir);
     migrateStateV2ToV3(dir);
     migrateStateV3ToV4(dir);
+    migrateStateV4ToV5(dir);
   }
 
   // For existing directories, generate root docs and infer taxonomy
   if (hasExistingContent) {
     generateRootDocs(dir);
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { inferTaxonomyFromDirs, loadTaxonomy, saveTaxonomy } = require('@/lib/workspace-taxonomy');
+      // Was lazy `require('@/lib/workspace-taxonomy')`; converted to static
+      // import after Turbopack's CJS↔ESM interop broke similar destructuring
+      // elsewhere in the codebase. workspace-taxonomy doesn't import this
+      // module back, so no circular-dep concern.
       const taxonomy = loadTaxonomy(dir);
       if (taxonomy.categories.length === 0) {
         const inferred = inferTaxonomyFromDirs(dir);
@@ -378,43 +609,59 @@ export function truncateContent(content: string, limit: number): string {
 export function loadWorkspaceFiles(dir: string): AssistantWorkspaceFilesV2 {
   const result: AssistantWorkspaceFilesV2 = {};
   const keys = Object.keys(FILE_MAP) as Array<keyof AssistantWorkspaceFiles>;
+  const instructionMirrors = inspectInstructionMirrors(dir);
 
   for (const key of keys) {
     const resolved = resolveFile(dir, key);
     if (resolved.exists) {
       const content = fs.readFileSync(resolved.filePath, 'utf-8');
       result[key] = truncateContent(content, PER_FILE_LIMIT);
+      if (key === 'claude') {
+        const selectedIsCanonical = path.basename(resolved.filePath) === CANONICAL_INSTRUCTIONS_FILE;
+        const claudeMirror = instructionMirrors.mirrors.find((mirror) => mirror.fileName === 'CLAUDE.md');
+        const codexMirror = instructionMirrors.mirrors.find((mirror) => mirror.fileName === 'AGENTS.md');
+        // A clean managed mirror is semantically the same source even though
+        // it is not the same inode. Legacy workspaces retain the original
+        // filesystem-identity rule and are never rewritten.
+        result.rulesFileNativeClaude = selectedIsCanonical
+          ? claudeMirror?.status === 'synced'
+          : sameFile(resolved.filePath, path.join(dir, 'CLAUDE.md'));
+        result.rulesFileNativeCodex = selectedIsCanonical
+          ? codexMirror?.status === 'synced'
+          : sameFile(resolved.filePath, path.join(dir, 'AGENTS.md'));
+        result.rulesMirrorConflicts = instructionMirrors.conflicts;
+      }
     }
   }
 
-  // Load daily memories (today + yesterday)
-  const dailyMemories = loadDailyMemories(dir, 2);
-  if (dailyMemories.length > 0) {
-    result.dailyMemories = dailyMemories.map(m =>
-      truncateContent(`## ${m.date}\n${m.content}`, DAILY_MEMORY_LIMIT)
-    );
-  }
+  // Daily memories and root docs are now accessed via MCP tools
+  // (codepilot_memory_search / codepilot_memory_get), not loaded into system prompt.
 
-  // Load root docs
-  const readmePath = path.join(dir, 'README.ai.md');
-  if (fs.existsSync(readmePath)) {
-    result.rootReadme = truncateContent(
-      fs.readFileSync(readmePath, 'utf-8'),
-      ROOT_DOC_LIMIT
-    );
-  }
-
-  const pathFilePath = path.join(dir, 'PATH.ai.md');
-  if (fs.existsSync(pathFilePath)) {
-    result.rootPath = truncateContent(
-      fs.readFileSync(pathFilePath, 'utf-8'),
-      ROOT_DOC_LIMIT
-    );
+  // Load HEARTBEAT.md
+  const heartbeatPath = path.join(dir, 'HEARTBEAT.md');
+  if (fs.existsSync(heartbeatPath)) {
+    result.heartbeatMd = fs.readFileSync(heartbeatPath, 'utf-8');
   }
 
   result.rootDir = dir;
 
   return result;
+}
+
+/**
+ * Decide whether CodePilot may omit the canonical rules fragment because the
+ * active Runtime has a proven native project-doc owner.
+ *
+ * Claude Code is the only proven owner today (real CLI POC with project
+ * settingSources). Codex intentionally returns false even for a synced
+ * AGENTS.md mirror: non-git cwd discovery and project_doc_max_bytes=0 have not
+ * been proven, so duplicate delivery is safer than silently losing rules.
+ */
+export function shouldOmitCanonicalRules(
+  nativeProjectRulesOwner: 'claude_code' | 'codex_runtime' | undefined,
+  files: Pick<AssistantWorkspaceFilesV2, 'rulesFileNativeClaude' | 'rulesFileNativeCodex'>,
+): boolean {
+  return nativeProjectRulesOwner === 'claude_code' && files.rulesFileNativeClaude === true;
 }
 
 // ==========================================
@@ -428,57 +675,27 @@ interface PromptSection {
   maxSize: number;
 }
 
-export function assembleWorkspacePrompt(files: AssistantWorkspaceFilesV2, retrievalResults?: SearchResult[]): string {
+export function assembleWorkspacePrompt(
+  files: AssistantWorkspaceFilesV2,
+  retrievalResults?: SearchResult[],
+  options?: { omitRules?: boolean },
+): string {
   const sections: PromptSection[] = [];
 
-  // Priority 1: Identity (claude + soul + user) — never drop claude
-  if (files.claude) {
-    sections.push({ tag: 'claude', content: files.claude, priority: 1, maxSize: PER_FILE_LIMIT });
+  // Identity layer only (instructions + soul + user). `files.claude` is a
+  // compatibility field for old callers; the prompt role itself is neutral
+  // so retention never depends on a framework-named internal key.
+  // Memory, daily memories, root docs, and retrieval results are now
+  // accessed via codepilot_memory_search / codepilot_memory_get MCP tools
+  // instead of being stuffed into the system prompt.
+  if (files.claude && !options?.omitRules) {
+    sections.push({ tag: 'instructions', content: files.claude, priority: 1, maxSize: PER_FILE_LIMIT });
   }
   if (files.soul) {
     sections.push({ tag: 'soul', content: files.soul, priority: 1, maxSize: PER_FILE_LIMIT });
   }
   if (files.user) {
     sections.push({ tag: 'user', content: files.user, priority: 1, maxSize: PER_FILE_LIMIT });
-  }
-
-  // Priority 2: Long-term memory
-  if (files.memory) {
-    sections.push({ tag: 'memory', content: files.memory, priority: 2, maxSize: PER_FILE_LIMIT });
-  }
-
-  // Priority 3: Daily memories
-  if (files.dailyMemories && files.dailyMemories.length > 0) {
-    for (let i = 0; i < files.dailyMemories.length; i++) {
-      sections.push({
-        tag: `daily-memory-${i}`,
-        content: files.dailyMemories[i],
-        priority: 3,
-        maxSize: DAILY_MEMORY_LIMIT,
-      });
-    }
-  }
-
-  // Priority 4: Root docs
-  if (files.rootReadme) {
-    sections.push({ tag: 'workspace-readme', content: files.rootReadme, priority: 4, maxSize: ROOT_DOC_LIMIT });
-  }
-  if (files.rootPath) {
-    sections.push({ tag: 'workspace-path', content: files.rootPath, priority: 4, maxSize: ROOT_DOC_LIMIT });
-  }
-
-  // Priority 5: Retrieval results
-  if (retrievalResults && retrievalResults.length > 0) {
-    const results = retrievalResults.slice(0, MAX_RETRIEVAL_RESULTS);
-    for (const result of results) {
-      const content = `**${result.path}** (${result.source}, score: ${result.score.toFixed(1)})\n${result.heading ? `### ${result.heading}\n` : ''}${result.snippet}`;
-      sections.push({
-        tag: 'retrieval-result',
-        content: truncateContent(content, RETRIEVAL_RESULT_LIMIT),
-        priority: 5,
-        maxSize: RETRIEVAL_RESULT_LIMIT,
-      });
-    }
   }
 
   if (sections.length === 0) return '';
@@ -496,9 +713,10 @@ export function assembleWorkspacePrompt(files: AssistantWorkspaceFilesV2, retrie
     const sectionSize = sectionContent.length + section.tag.length * 2 + 10; // tag overhead
 
     if (totalSize + sectionSize + wrapperOverhead > TOTAL_PROMPT_LIMIT) {
-      // Drop low-priority content on overflow, but never drop claude.md
-      if (section.tag === 'claude') {
-        // Force include claude.md even on overflow
+      // Drop low-priority content on overflow, but never drop the canonical
+      // instruction role (regardless of which legacy filename supplied it).
+      if (section.tag === 'instructions') {
+        // Force include instructions even on overflow.
         included.push(`<${section.tag}>\n${sectionContent}\n</${section.tag}>`);
         totalSize += sectionSize;
       }
@@ -539,6 +757,10 @@ export function loadState(dir: string): AssistantWorkspaceState {
       migrateStateV3ToV4(dir);
       migrated = true;
     }
+    if (state.schemaVersion < 5) {
+      migrateStateV4ToV5(dir);
+      migrated = true;
+    }
     if (migrated) {
       return loadState(dir); // Reload after migration
     }
@@ -555,24 +777,60 @@ export function saveState(dir: string, state: AssistantWorkspaceState): void {
     fs.mkdirSync(stateDir, { recursive: true });
   }
   const statePath = path.join(stateDir, STATE_FILE);
-  const tmpPath = statePath + '.tmp';
-  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
-  fs.renameSync(tmpPath, statePath);
+  const tmpPath = `${statePath}.tmp-${process.pid}-${cryptoRandomSuffix()}`;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tmpPath, 'wx');
+    fs.writeFileSync(fd, JSON.stringify(state, null, 2), 'utf-8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmpPath, statePath);
+
+    // Persist the directory entry where the platform supports directory fsync.
+    // Windows commonly rejects opening directories; rename is still atomic
+    // there, so this final durability flush is deliberately best-effort.
+    try {
+      const dirFd = fs.openSync(stateDir, 'r');
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch { /* platform does not support directory fsync */ }
+  } catch (error) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+    try { fs.unlinkSync(tmpPath); } catch { /* nothing to clean */ }
+    throw error;
+  }
 }
 
+function cryptoRandomSuffix(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** @deprecated Use shouldRunHeartbeat instead */
 export function needsDailyCheckIn(state: AssistantWorkspaceState, now?: Date): boolean {
-  if (!state.onboardingComplete) return false;
-  if (state.dailyCheckInEnabled !== true) return false;
+  return shouldRunHeartbeat(state, undefined, now);
+}
+
+export function shouldRunHeartbeat(
+  state: AssistantWorkspaceState,
+  heartbeatConfig?: { activeHours?: { start?: string; end?: string } },
+  now?: Date,
+): boolean {
+  if (state.heartbeatEnabled !== true) return false;
+
   const d = now ?? new Date();
   const localToday = getLocalDateString(d);
-  if (state.lastCheckInDate === localToday) return false;
+  const lastDate = state.lastHeartbeatDate ?? state.lastCheckInDate;
+  if (lastDate === localToday) return false;
 
-  // Compat: before schema v3, lastCheckInDate was stored as a UTC date.
-  // If the stored value matches today's UTC date, the user checked in "today"
-  // under the old semantics. Accept it to avoid a spurious re-trigger.
-  // Once the next check-in writes a local date + v3, this path becomes inert.
+  // Compat: before schema v3, dates were stored as UTC
   const utcToday = d.toISOString().slice(0, 10);
-  if (state.lastCheckInDate === utcToday) return false;
+  if (lastDate === utcToday) return false;
+
+  if (heartbeatConfig?.activeHours) {
+    if (!isWithinActiveHours(heartbeatConfig.activeHours)) return false;
+  }
 
   return true;
 }

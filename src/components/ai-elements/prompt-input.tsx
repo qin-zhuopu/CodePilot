@@ -55,13 +55,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import {
-  ArrowElbowDownLeft,
-  Image,
-  Plus,
-  Square,
-  X,
-} from "@phosphor-icons/react";
+import { ArrowElbowDownLeft, Square, X } from "@phosphor-icons/react";
+import { CodePilotIcon } from "@/components/ui/semantic-icon";
 import { nanoid } from "nanoid";
 import {
   Children,
@@ -177,8 +172,12 @@ export const PromptInputProvider = ({
   const clearInput = useCallback(() => setTextInput(""), []);
 
   // ----- attachments state (global when wrapped)
+  // `size` is preserved on top of FileUIPart so downstream chip
+  // estimators (FileAttachmentsCapsules, MessageInput's pending-token
+  // total) can show "~3.2K" without re-fetching the file. FileUIPart
+  // itself drops byte counts after the conversion to base64/URL.
   const [attachmentFiles, setAttachmentFiles] = useState<
-    (FileUIPart & { id: string })[]
+    (FileUIPart & { id: string; size?: number })[]
   >([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   // oxlint-disable-next-line eslint(no-empty-function)
@@ -198,6 +197,7 @@ export const PromptInputProvider = ({
         mediaType: file.type,
         type: "file" as const,
         url: URL.createObjectURL(file),
+        size: file.size,
       })),
     ]);
   }, []);
@@ -353,7 +353,7 @@ export const PromptInputActionAddAttachments = ({
 
   return (
     <DropdownMenuItem {...props} onSelect={handleSelect}>
-      <Image className="mr-2 size-4" /> {label}
+      <CodePilotIcon name="image" size="md" className="mr-2" aria-hidden /> {label}
     </DropdownMenuItem>
   );
 };
@@ -382,11 +382,49 @@ export type PromptInputProps = Omit<
     code: "max_files" | "max_file_size" | "accept";
     message: string;
   }) => void;
+  /**
+   * Called when directories are dragged onto the prompt input. Caller is
+   * responsible for turning each File into a usable path (e.g. via
+   * `window.electronAPI?.fs?.getPathForFile`). When unset, directories are
+   * silently dropped — this keeps the component generic while letting the
+   * @mention-aware composer route them to a "@path/" insertion.
+   */
+  onDirectoriesDropped?: (dirs: File[]) => void;
   onSubmit: (
     message: PromptInputMessage,
     event: FormEvent<HTMLFormElement>
   ) => void | Promise<void>;
 };
+
+/**
+ * Classify a DragEvent's items into files vs directories using
+ * `DataTransferItem.webkitGetAsEntry()`. Called before handing control to the
+ * default `add()` so directories don't get mis-ingested as 0-size blobs.
+ */
+export function classifyDroppedItems(e: DragEvent): { files: File[]; dirs: File[] } {
+  const files: File[] = [];
+  const dirs: File[] = [];
+  const items = e.dataTransfer?.items;
+  if (items && items.length > 0) {
+    for (const item of Array.from(items)) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (!file) continue;
+      const entry = typeof item.webkitGetAsEntry === "function"
+        ? item.webkitGetAsEntry()
+        : null;
+      if (entry?.isDirectory) {
+        dirs.push(file);
+      } else {
+        files.push(file);
+      }
+    }
+  } else if (e.dataTransfer?.files) {
+    // Safari < 13 fallback: no items API. Best-effort treat all as files.
+    for (const f of Array.from(e.dataTransfer.files)) files.push(f);
+  }
+  return { files, dirs };
+}
 
 export const PromptInput = ({
   className,
@@ -397,6 +435,7 @@ export const PromptInput = ({
   maxFiles,
   maxFileSize,
   onError,
+  onDirectoriesDropped,
   onSubmit,
   children,
   ...props
@@ -410,7 +449,13 @@ export const PromptInput = ({
   const formRef = useRef<HTMLFormElement | null>(null);
 
   // ----- Local attachments (only used when no provider)
-  const [items, setItems] = useState<(FileUIPart & { id: string })[]>([]);
+  // Same `size` extension as the provider-scoped state above — the
+  // chat composer's PromptInput is unwrapped (not nested in a
+  // PromptInputProvider) and therefore goes through this *local*
+  // attachments path. Without preserving size here, FileAttachmentsCapsules
+  // can't show the "~3.2K" estimate and AttachmentPendingTracker can't
+  // contribute to Run pending tokens. (Codex P2 finding, April 2026.)
+  const [items, setItems] = useState<(FileUIPart & { id: string; size?: number })[]>([]);
   const files = usingProvider ? controller.attachments.files : items;
 
   // ----- Local referenced sources (always local to PromptInput)
@@ -491,7 +536,7 @@ export const PromptInput = ({
             message: "Too many files. Some were not added.",
           });
         }
-        const next: (FileUIPart & { id: string })[] = [];
+        const next: (FileUIPart & { id: string; size?: number })[] = [];
         for (const file of capped) {
           next.push({
             filename: file.name,
@@ -499,6 +544,7 @@ export const PromptInput = ({
             mediaType: file.type,
             type: "file",
             url: URL.createObjectURL(file),
+            size: file.size,
           });
         }
         return [...prev, ...next];
@@ -630,9 +676,9 @@ export const PromptInput = ({
       if (e.dataTransfer?.types?.includes("Files")) {
         e.preventDefault();
       }
-      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        add(e.dataTransfer.files);
-      }
+      const { files, dirs } = classifyDroppedItems(e);
+      if (dirs.length > 0) onDirectoriesDropped?.(dirs);
+      if (files.length > 0) add(files);
     };
     form.addEventListener("dragover", onDragOver);
     form.addEventListener("drop", onDrop);
@@ -640,7 +686,7 @@ export const PromptInput = ({
       form.removeEventListener("dragover", onDragOver);
       form.removeEventListener("drop", onDrop);
     };
-  }, [add, globalDrop]);
+  }, [add, globalDrop, onDirectoriesDropped]);
 
   useEffect(() => {
     if (!globalDrop) {
@@ -656,9 +702,9 @@ export const PromptInput = ({
       if (e.dataTransfer?.types?.includes("Files")) {
         e.preventDefault();
       }
-      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        add(e.dataTransfer.files);
-      }
+      const { files, dirs } = classifyDroppedItems(e);
+      if (dirs.length > 0) onDirectoriesDropped?.(dirs);
+      if (files.length > 0) add(files);
     };
     document.addEventListener("dragover", onDragOver);
     document.addEventListener("drop", onDrop);
@@ -666,7 +712,7 @@ export const PromptInput = ({
       document.removeEventListener("dragover", onDragOver);
       document.removeEventListener("drop", onDrop);
     };
-  }, [add, globalDrop]);
+  }, [add, globalDrop, onDirectoriesDropped]);
 
   useEffect(
     () => () => {
@@ -678,7 +724,7 @@ export const PromptInput = ({
         }
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- cleanup only on unmount; filesRef always current
+     
     [usingProvider]
   );
 
@@ -923,13 +969,23 @@ export const PromptInputTextarea = ({
   const handleCompositionEnd = useCallback(() => setIsComposing(false), []);
   const handleCompositionStart = useCallback(() => setIsComposing(true), []);
 
+  // Honor an explicit `value` prop (caller-controlled) over the internal
+  // controller state. Without this, `{...controlledProps}` (spread AFTER
+  // `{...props}` below) clobbers the caller's `value`, so a caller that
+  // controls the textarea via its own state (MessageInput → `inputValue`)
+  // has its value silently ignored: its optimistic clear updates its state
+  // but never reaches the DOM, leaving sent text lingering in the box and
+  // the Stop/queue button showing over stale text (tech-debt #52 P1). We
+  // still sync the controller on change so PromptInput's internal submit /
+  // attachment logic keeps a consistent view.
+  const hasExplicitValue = props.value !== undefined;
   const controlledProps = controller
     ? {
         onChange: (e: ChangeEvent<HTMLTextAreaElement>) => {
           controller.textInput.setInput(e.currentTarget.value);
           onChange?.(e);
         },
-        value: controller.textInput.value,
+        value: hasExplicitValue ? (props.value as string) : controller.textInput.value,
       }
     : {
         onChange,
@@ -1062,7 +1118,7 @@ export const PromptInputActionMenuTrigger = ({
 }: PromptInputActionMenuTriggerProps) => (
   <DropdownMenuTrigger asChild>
     <PromptInputButton className={className} {...props}>
-      {children ?? <Plus className="size-4" />}
+      {children ?? <CodePilotIcon name="plus" size="md" aria-hidden />}
     </PromptInputButton>
   </DropdownMenuTrigger>
 );

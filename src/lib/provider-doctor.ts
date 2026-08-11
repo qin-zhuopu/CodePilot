@@ -11,28 +11,43 @@ import {
   findAllClaudeBinaries,
   isWindows,
   findGitBash,
-  getExpandedPath,
 } from '@/lib/platform';
-import { resolveProvider, resolveForClaudeCode, toClaudeCodeEnv } from '@/lib/provider-resolver';
+import { resolveProvider, resolveForClaudeCode } from '@/lib/provider-resolver';
+import { prepareSdkSubprocessEnv } from '@/lib/sdk-subprocess-env';
 import {
   getAllProviders,
   getDefaultProviderId,
   getModelsForProvider,
   getProvider,
+  getProviderSecretStorageDiagnostics,
   getSetting,
 } from '@/lib/db';
 import {
   getDefaultModelsForProvider,
   inferProtocolFromLegacy,
+  getEffectiveProviderProtocol,
   findPresetForLegacy,
   type Protocol,
 } from '@/lib/provider-catalog';
 import { classifyError, type ClassifiedError } from '@/lib/error-classifier';
+import { getOAuthStatus } from '@/lib/openai-oauth-manager';
+import { getXaiOAuthStatus } from '@/lib/xai-oauth-manager';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Options, SDKResultSuccess } from '@anthropic-ai/claude-agent-sdk';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import { getCodexAvailability } from '@/lib/codex/app-server-manager';
+import {
+  buildClaudeRuntimeProbe,
+  buildCodexRuntimeProbe,
+  buildNativeRuntimeProbe,
+} from '@/lib/runtime-probe';
+import {
+  MACOS_KEYCHAIN_GUARD_ACTIVE_ENV,
+  MACOS_KEYCHAIN_REASON_ENV,
+  MACOS_KEYCHAIN_STATE_ENV,
+} from '@/lib/macos-keychain-guard';
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -167,11 +182,129 @@ async function runCliProbe(): Promise<ProbeResult> {
   };
 }
 
+// ── Runtime execution-chain probe ───────────────────────────────
+
+async function runRuntimeProbe(): Promise<ProbeResult> {
+  const findings: Finding[] = [];
+  const start = Date.now();
+
+  const native = buildNativeRuntimeProbe();
+  findings.push({
+    severity: 'ok',
+    code: 'runtime.native',
+    message: 'CodePilot Runtime is bundled and available in-process',
+    detail: JSON.stringify(native),
+  });
+
+  const claudePath = findClaudeBinary();
+  const claudeVersion = claudePath ? await getClaudeVersion(claudePath) : null;
+  const gitBash = isWindows ? findGitBash() : null;
+  const claude = buildClaudeRuntimeProbe({
+    connected: !!claudeVersion,
+    version: claudeVersion,
+    binaryPath: claudePath,
+    installType: claudePath ? 'unknown' : null,
+    missingGit: isWindows && !gitBash,
+  }, { gitBashPath: gitBash });
+  findings.push({
+    severity: claude.binary.probe === 'passed' ? (claude.shell?.probe === 'failed' ? 'warn' : 'ok') : 'warn',
+    code: claude.binary.probe === 'passed' ? 'runtime.claude.probed' : 'runtime.claude.not-ready',
+    message: claude.binary.probe === 'passed'
+      ? 'Claude Code binary version probe passed'
+      : 'Claude Code binary execution has not been verified',
+    detail: JSON.stringify(claude),
+  });
+
+  const codexAvailability = await getCodexAvailability();
+  const codex = buildCodexRuntimeProbe(codexAvailability);
+  const codexSeverity: Severity = codexAvailability.kind === 'ready' || codexAvailability.kind === 'installed_idle'
+    ? codex.sandbox?.state === 'error' ? 'error' : codex.sandbox?.state === 'degraded' ? 'warn' : 'ok'
+    : codexAvailability.kind === 'spawn_failed' || codexAvailability.kind === 'too_old'
+      ? 'error'
+      : 'warn';
+  findings.push({
+    severity: codexSeverity,
+    code: `runtime.codex.${codexAvailability.kind}`,
+    message: codexAvailability.kind === 'ready'
+      ? 'Codex app-server initialized; sandbox readiness is reported separately'
+      : codexAvailability.kind === 'installed_idle'
+        ? 'Codex binary probe passed; app-server and sandbox have not run yet'
+        : codexAvailability.kind === 'desktop_only'
+          ? 'Codex desktop app found, but no executable standalone CLI is available'
+          : codexAvailability.kind === 'not_installed'
+            ? 'No executable Codex CLI was found'
+            : 'Codex execution chain has a blocking diagnostic',
+    detail: JSON.stringify(codex),
+  });
+
+  return {
+    probe: 'runtime',
+    severity: probeSeverity(findings),
+    findings,
+    durationMs: Date.now() - start,
+  };
+}
+
 // ── Auth Probe ──────────────────────────────────────────────────
 
 async function runAuthProbe(): Promise<ProbeResult> {
   const findings: Finding[] = [];
   const start = Date.now();
+
+  if (process.platform === 'darwin' && process.env[MACOS_KEYCHAIN_STATE_ENV] === 'unavailable') {
+    findings.push({
+      severity: 'warn',
+      code: 'auth.macos-default-keychain-unavailable',
+      message: 'The default macOS keychain is unavailable; blocking Claude credential prompts are suppressed',
+      detail: JSON.stringify({
+        reason: process.env[MACOS_KEYCHAIN_REASON_ENV] || 'unknown',
+        claudeCredentialGuard: process.env[MACOS_KEYCHAIN_GUARD_ACTIVE_ENV] === '1'
+          ? 'active'
+          : 'activates_per_subprocess',
+      }),
+    });
+  }
+
+  const secretStorage = getProviderSecretStorageDiagnostics();
+  const storageDetail = JSON.stringify({
+    backend: secretStorage.backend,
+    securityLevel: secretStorage.securityLevel,
+    encryptedProviders: secretStorage.encryptedProviders,
+    legacyPlaintextProviders: secretStorage.legacyPlaintextProviders,
+    emptyProviders: secretStorage.emptyProviders,
+    lastErrorCode: secretStorage.lastErrorCode,
+  });
+  if (secretStorage.lastErrorCode) {
+    findings.push({
+      severity: 'error',
+      code: 'auth.provider-secret-decrypt-failed',
+      message: 'A stored provider credential could not be decrypted',
+      detail: storageDetail,
+    });
+  } else if (secretStorage.legacyPlaintextProviders > 0) {
+    findings.push({
+      severity: 'warn',
+      code: 'auth.provider-secret-legacy-plaintext',
+      message: `${secretStorage.legacyPlaintextProviders} provider credential(s) still use legacy plaintext storage`,
+      detail: storageDetail,
+    });
+  } else if (secretStorage.encryptedProviders > 0) {
+    findings.push({
+      severity: secretStorage.securityLevel === 'degraded' ? 'warn' : 'ok',
+      code: 'auth.provider-secret-encrypted',
+      message: `${secretStorage.encryptedProviders} provider credential(s) are encrypted at rest`,
+      detail: storageDetail,
+    });
+  } else {
+    findings.push({
+      severity: secretStorage.available ? 'ok' : 'warn',
+      code: secretStorage.available ? 'auth.provider-secret-ready' : 'auth.provider-secret-storage-unavailable',
+      message: secretStorage.available
+        ? 'OS-protected provider credential storage is ready'
+        : 'OS-protected provider credential storage is unavailable in this process',
+      detail: storageDetail,
+    });
+  }
 
   // Check environment auth
   const envApiKey = process.env.ANTHROPIC_API_KEY;
@@ -213,15 +346,50 @@ async function runAuthProbe(): Promise<ProbeResult> {
     });
   }
 
+  // Check OpenAI OAuth status
+  let openaiOAuthOk = false;
+  try {
+    const oauthStatus = getOAuthStatus();
+    if (oauthStatus.authenticated) {
+      openaiOAuthOk = true;
+      findings.push({
+        severity: oauthStatus.needsRefresh ? 'warn' : 'ok',
+        code: 'auth.openai-oauth',
+        message: `OpenAI OAuth authenticated${oauthStatus.email ? ` (${oauthStatus.email})` : ''}${oauthStatus.plan ? ` — ${oauthStatus.plan}` : ''}`,
+        ...(oauthStatus.needsRefresh ? { detail: 'Token is near expiry and will be refreshed on next use' } : {}),
+      });
+    }
+  } catch { /* OpenAI OAuth not available */ }
+
+  let xaiOAuthOk = false;
+  try {
+    const xaiStatus = getXaiOAuthStatus();
+    if (xaiStatus.authenticated) {
+      xaiOAuthOk = true;
+      findings.push({
+        severity: xaiStatus.needsRefresh ? 'warn' : 'ok',
+        code: 'auth.xai-oauth',
+        message: `xAI OAuth authenticated${xaiStatus.email ? ` (${xaiStatus.email})` : ''}`,
+        ...(xaiStatus.needsRefresh ? { detail: 'Token is near expiry and will be refreshed on next use' } : {}),
+      });
+    }
+  } catch { /* xAI OAuth not available */ }
+
   if (!envApiKey && !envAuthToken && !dbAuthToken) {
     // Check if there are any configured providers with keys
     const providers = getAllProviders();
     const withKeys = providers.filter(p => !!p.api_key);
-    if (withKeys.length === 0) {
+    if (withKeys.length === 0 && !openaiOAuthOk && !xaiOAuthOk) {
       findings.push({
         severity: 'error',
         code: 'auth.no-credentials',
-        message: 'No API credentials found (environment, DB settings, or providers)',
+        message: 'No API credentials found (environment, DB settings, providers, OpenAI OAuth, or xAI OAuth)',
+      });
+    } else if (withKeys.length === 0 && (openaiOAuthOk || xaiOAuthOk)) {
+      findings.push({
+        severity: 'ok',
+        code: 'auth.oauth-only',
+        message: `No Anthropic credentials, but ${openaiOAuthOk && xaiOAuthOk ? 'OpenAI and xAI OAuth are' : openaiOAuthOk ? 'OpenAI OAuth is' : 'xAI OAuth is'} available`,
       });
     } else {
       findings.push({
@@ -336,25 +504,58 @@ async function runProviderProbe(): Promise<ProbeResult> {
 
   // Check each provider for common issues
   for (const p of providers) {
-    if (!p.base_url && p.protocol && !['anthropic'].includes(p.protocol)) {
+    // Compute effective protocol up-front — legacy Default rows have
+    // protocol='' and rely on inference; driving diagnostics off raw
+    // p.protocol would miss exactly those rows.
+    const protocol: Protocol = getEffectiveProviderProtocol(
+      p.provider_type,
+      p.protocol,
+      p.base_url,
+      p.preset_key,
+    );
+
+    // Protocols that legitimately have no base_url:
+    //   - anthropic: ambiguous (separate diagnostic below)
+    //   - bedrock / vertex: IAM / gcloud ADC auth, no HTTP endpoint
+    //     configured by the user (matches testProviderConnection's
+    //     SKIPPED branch for cloud providers)
+    const protocolsWithoutUrl = new Set(['anthropic', 'bedrock', 'vertex']);
+    if (!p.base_url && !protocolsWithoutUrl.has(protocol)) {
       findings.push({
         severity: 'warn',
         code: 'provider.missing-base-url',
-        message: `Provider "${p.name}" (${p.protocol}) has no base_url`,
+        message: `Provider "${p.name}" (${protocol}) has no base_url`,
         detail: `Provider ID: ${p.id}`,
       });
     }
 
-    // Check if the provider has any available models
-    const protocol: Protocol = (p.protocol as Protocol) ||
-      inferProtocolFromLegacy(p.provider_type, p.base_url);
+    // Empty base_url on an anthropic-protocol provider is genuinely
+    // ambiguous: it could be a legacy "Default" row migrated from older
+    // settings (which we route to first-party catalog so the user gets
+    // Opus 4.7 / xhigh / 1M), OR a third-party preset that forgot to
+    // fill the URL (which would silently proxy to api.anthropic.com).
+    // We can't tell them apart without a persisted preset_key, so we
+    // surface a warn + actionable suggestion either way. Write-path
+    // validation (/api/providers) blocks new occurrences of this state.
+    //
+    // Uses the *effective* protocol so legacy rows with raw protocol=''
+    // — i.e. exactly the migrations we most want to flag — still get
+    // the diagnostic.
+    if (!p.base_url && protocol === 'anthropic') {
+      findings.push({
+        severity: 'warn',
+        code: 'provider.anthropic-empty-base-url',
+        message: `Provider "${p.name}" uses Anthropic protocol but has no base_url`,
+        detail: `Provider ID: ${p.id}. If this is the official Anthropic API, set base_url to https://api.anthropic.com. If it's a third-party proxy, set its endpoint URL. Empty base_url silently proxies to the official Anthropic endpoint and inherits first-party capabilities, which is almost never what a third-party configuration intends.`,
+      });
+    }
     let hasModels = false;
     try {
       const dbModels = getModelsForProvider(p.id);
       if (dbModels.length > 0) hasModels = true;
     } catch { /* table may not exist */ }
     if (!hasModels) {
-      const catalogModels = getDefaultModelsForProvider(protocol, p.base_url);
+      const catalogModels = getDefaultModelsForProvider(protocol, p.base_url, p.provider_type);
       if (catalogModels.length > 0) hasModels = true;
     }
     // Also check role_models_json.default — it synthesizes a model entry at runtime
@@ -391,7 +592,7 @@ async function runProviderProbe(): Promise<ProbeResult> {
       // Check if a matched preset provides its own model names (not ANTHROPIC_DEFAULT_MODELS).
       // If the preset has sdkProxyOnly or has its own models, the preset itself handles naming.
       // But for generic anthropic-thirdparty or unmatched presets, warn.
-      const matchedPreset = findPresetForLegacy(p.base_url, p.provider_type, protocol as Protocol);
+      const matchedPreset = findPresetForLegacy(p.base_url, p.provider_type, protocol as Protocol, p.preset_key);
       const presetHandlesModels = matchedPreset && (
         matchedPreset.key === 'anthropic-official' ||
         matchedPreset.defaultRoleModels?.default ||
@@ -408,7 +609,7 @@ async function runProviderProbe(): Promise<ProbeResult> {
     }
 
     // Check B: sdkProxyOnly provider warning
-    const matchedPreset = findPresetForLegacy(p.base_url, p.provider_type, protocol as Protocol);
+    const matchedPreset = findPresetForLegacy(p.base_url, p.provider_type, protocol as Protocol, p.preset_key);
     if (matchedPreset?.sdkProxyOnly) {
       findings.push({
         severity: 'ok',
@@ -701,7 +902,7 @@ async function runLiveProbe(): Promise<ProbeResult> {
   // 1. Resolve the current provider
   let resolved;
   try {
-    resolved = resolveForClaudeCode();
+    resolved = resolveForClaudeCode(undefined, { callScene: 'connection_test' });
   } catch (err) {
     findings.push({
       severity: 'warn',
@@ -733,20 +934,13 @@ async function runLiveProbe(): Promise<ProbeResult> {
     return { probe: 'live', severity: probeSeverity(findings), findings, durationMs: Date.now() - start };
   }
 
-  // 4. Build env
-  const sdkEnv: Record<string, string> = { ...process.env as Record<string, string> };
-  if (!sdkEnv.HOME) sdkEnv.HOME = os.homedir();
-  if (!sdkEnv.USERPROFILE) sdkEnv.USERPROFILE = os.homedir();
-  sdkEnv.PATH = getExpandedPath();
-  delete sdkEnv.CLAUDECODE;
-
-  if (process.platform === 'win32' && !process.env.CLAUDE_CODE_GIT_BASH_PATH) {
-    const gitBashPath = findGitBash();
-    if (gitBashPath) sdkEnv.CLAUDE_CODE_GIT_BASH_PATH = gitBashPath;
-  }
-
-  const resolvedEnv = toClaudeCodeEnv(sdkEnv, resolved);
-  Object.assign(sdkEnv, resolvedEnv);
+  // 4. Build env via the shared helper so the live probe sees the EXACT same
+  // provider-owned auth isolation as the real chat path. Otherwise the
+  // diagnostic could pass against cc-switch's Anthropic-direct credentials
+  // while the actual chat hits the explicit DB provider, producing a
+  // confusing "doctor green, chat broken" split.
+  const setup = prepareSdkSubprocessEnv(resolved);
+  const sdkEnv = setup.env;
 
   // 5. Build query options
   const LIVE_PROBE_TIMEOUT = 15_000;
@@ -847,6 +1041,9 @@ async function runLiveProbe(): Promise<ProbeResult> {
         ].filter(Boolean).join('\n'),
       });
     }
+  } finally {
+    // Tear down the per-request shadow ~/.claude/ if we built one. Best-effort.
+    setup.shadow.cleanup();
   }
 
   return {
@@ -942,16 +1139,13 @@ function attachRepairsToFindings(probes: ProbeResult[]): void {
             const targetPid = defaultProviderId || firstProvider?.id;
             if (!targetPid) continue;
             params.providerId = targetPid;
-            // Detect current auth style from the provider's extra_env and suggest the opposite
+            // Detect current auth style from preset catalog (not extra_env)
             const targetProvider = getProvider(targetPid);
             if (targetProvider) {
-              try {
-                const env = JSON.parse(targetProvider.extra_env || '{}');
-                const currentlyUsingToken = 'ANTHROPIC_AUTH_TOKEN' in env;
-                params.authStyle = currentlyUsingToken ? 'api-key' : 'auth-token';
-              } catch {
-                params.authStyle = 'auth-token'; // safe default
-              }
+              const protocol = (targetProvider.protocol || inferProtocolFromLegacy(targetProvider.provider_type, targetProvider.base_url, targetProvider.preset_key)) as Protocol;
+              const preset = findPresetForLegacy(targetProvider.base_url, targetProvider.provider_type, protocol, targetProvider.preset_key);
+              const currentlyUsingToken = preset?.authStyle === 'auth_token';
+              params.authStyle = currentlyUsingToken ? 'api-key' : 'auth-token';
             }
             break;
           }
@@ -995,6 +1189,7 @@ export async function runDiagnosis(): Promise<DiagnosisResult> {
   const start = Date.now();
 
   const probes = await Promise.all([
+    runRuntimeProbe(),
     runCliProbe(),
     runAuthProbe(),
     runProviderProbe(),

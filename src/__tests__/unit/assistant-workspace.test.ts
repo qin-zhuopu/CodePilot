@@ -6,11 +6,12 @@
  * Tests verify:
  * 1. Auto-trigger: onboarding detects correctly for new workspace
  * 2. Input focus fallback: hookTriggeredSessionId prevents repeat
- * 3. Daily check-in: needsDailyCheckIn respects onboarding state
+ * 3. Daily check-in: needsDailyCheckIn respects onboarding state (uses heartbeat fields)
  * 4. Workspace prompt scoping: only assistant project sessions get prompts
  * 5. V2: Daily memory write/load, v1→v2 migration, budget-aware prompt assembly
  */
 
+import '../db-isolation.setup';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'path';
@@ -29,6 +30,9 @@ const {
   saveState,
   needsDailyCheckIn,
   loadWorkspaceFiles,
+  inspectInstructionMirrors,
+  reconcileInstructionMirrors,
+  shouldOmitCanonicalRules,
   assembleWorkspacePrompt,
   generateDirectoryDocs,
   ensureDailyDir,
@@ -59,16 +63,92 @@ describe('Assistant Workspace', () => {
 
       const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
       assert.equal(state.onboardingComplete, false);
-      assert.equal(state.lastCheckInDate, null);
-      assert.equal(state.schemaVersion, 4);
+      assert.equal(state.lastHeartbeatDate, null);
+      assert.equal(state.schemaVersion, 5);
     });
 
-    it('should create all 4 template files', () => {
+    it('creates neutral templates plus Claude Code and Codex discovery mirrors', () => {
       initializeWorkspace(workDir);
-      assert.ok(fs.existsSync(path.join(workDir, 'claude.md')));
+      assert.ok(fs.existsSync(path.join(workDir, 'instructions.md')));
+      assert.ok(fs.existsSync(path.join(workDir, 'CLAUDE.md')));
+      assert.ok(fs.existsSync(path.join(workDir, 'AGENTS.md')));
       assert.ok(fs.existsSync(path.join(workDir, 'soul.md')));
       assert.ok(fs.existsSync(path.join(workDir, 'user.md')));
       assert.ok(fs.existsSync(path.join(workDir, 'memory.md')));
+      const canonical = fs.readFileSync(path.join(workDir, 'instructions.md'), 'utf8');
+      assert.ok(fs.readFileSync(path.join(workDir, 'CLAUDE.md'), 'utf8').endsWith(canonical));
+      assert.ok(fs.readFileSync(path.join(workDir, 'AGENTS.md'), 'utf8').endsWith(canonical));
+    });
+
+    it('keeps a legacy rules file as the single source instead of creating a duplicate', () => {
+      fs.writeFileSync(path.join(workDir, 'CLAUDE.md'), '# Existing rules\n', 'utf-8');
+      initializeWorkspace(workDir);
+
+      assert.equal(fs.existsSync(path.join(workDir, 'instructions.md')), false);
+      assert.equal(fs.existsSync(path.join(workDir, 'AGENTS.md')), false);
+      const files = loadWorkspaceFiles(workDir);
+      assert.equal(files.claude, '# Existing rules\n');
+      assert.equal(files.rulesFileNativeClaude, true);
+    });
+
+    it('marks clean managed mirrors as native discovery owners', () => {
+      initializeWorkspace(workDir);
+      const files = loadWorkspaceFiles(workDir);
+      assert.equal(files.rulesFileNativeClaude, true);
+      assert.equal(files.rulesFileNativeCodex, true);
+      assert.deepEqual(files.rulesMirrorConflicts, []);
+    });
+
+    it('updates both untouched mirrors when instructions.md changes', () => {
+      initializeWorkspace(workDir);
+      fs.writeFileSync(path.join(workDir, 'instructions.md'), '# Updated canonical rules\n', 'utf8');
+
+      const result = reconcileInstructionMirrors(workDir);
+      assert.deepEqual(result.conflicts, []);
+      assert.deepEqual(result.updated.map((file) => path.basename(file)).sort(), ['AGENTS.md', 'CLAUDE.md']);
+      for (const fileName of ['CLAUDE.md', 'AGENTS.md']) {
+        assert.ok(
+          fs.readFileSync(path.join(workDir, fileName), 'utf8').endsWith('# Updated canonical rules\n'),
+        );
+      }
+    });
+
+    it('freezes the mirror pair when one managed file was edited by the user', () => {
+      initializeWorkspace(workDir);
+      const agentsBefore = fs.readFileSync(path.join(workDir, 'AGENTS.md'), 'utf8');
+      fs.appendFileSync(path.join(workDir, 'CLAUDE.md'), '\n# User-owned change\n', 'utf8');
+      fs.writeFileSync(path.join(workDir, 'instructions.md'), '# New canonical content\n', 'utf8');
+
+      const result = reconcileInstructionMirrors(workDir);
+      assert.deepEqual(result.conflicts, ['CLAUDE.md']);
+      assert.match(fs.readFileSync(path.join(workDir, 'CLAUDE.md'), 'utf8'), /User-owned change/);
+      assert.equal(fs.readFileSync(path.join(workDir, 'AGENTS.md'), 'utf8'), agentsBefore);
+      assert.equal(loadWorkspaceFiles(workDir).rulesFileNativeClaude, false);
+      assert.equal(loadWorkspaceFiles(workDir).rulesFileNativeCodex, false);
+    });
+
+    it('never creates the other mirror beside an unmanaged compatibility file', () => {
+      fs.writeFileSync(path.join(workDir, 'instructions.md'), '# Canonical\n', 'utf8');
+      fs.writeFileSync(path.join(workDir, 'CLAUDE.md'), '# Existing custom Claude rules\n', 'utf8');
+
+      const result = reconcileInstructionMirrors(workDir);
+      assert.deepEqual(result.conflicts, ['CLAUDE.md']);
+      assert.equal(fs.existsSync(path.join(workDir, 'AGENTS.md')), false);
+      assert.equal(inspectInstructionMirrors(workDir).mirrors[0].status, 'unmanaged');
+    });
+
+    it('accepts a symlink to canonical but never replaces a foreign symlink', {
+      skip: process.platform === 'win32' ? 'ordinary Windows users cannot create file symlinks' : false,
+    }, () => {
+      fs.writeFileSync(path.join(workDir, 'instructions.md'), '# Canonical\n', 'utf8');
+      fs.symlinkSync('instructions.md', path.join(workDir, 'CLAUDE.md'));
+      fs.writeFileSync(path.join(workDir, 'foreign.md'), '# Foreign\n', 'utf8');
+      fs.symlinkSync('foreign.md', path.join(workDir, 'AGENTS.md'));
+
+      const result = reconcileInstructionMirrors(workDir);
+      assert.deepEqual(result.conflicts, ['AGENTS.md']);
+      assert.equal(fs.readlinkSync(path.join(workDir, 'CLAUDE.md')), 'instructions.md');
+      assert.equal(fs.readlinkSync(path.join(workDir, 'AGENTS.md')), 'foreign.md');
     });
 
     it('should create V2 directories (memory/daily, Inbox)', () => {
@@ -91,7 +171,7 @@ describe('Assistant Workspace', () => {
       initializeWorkspace(workDir);
       const state = loadState(workDir);
       state.onboardingComplete = true;
-      state.lastCheckInDate = getLocalDateString();
+      state.lastHeartbeatDate = getLocalDateString();
       saveState(workDir, state);
 
       const reloaded = loadState(workDir);
@@ -124,29 +204,29 @@ describe('Assistant Workspace', () => {
 
   describe('daily check-in respects onboarding state', () => {
     it('should not trigger check-in if onboarding not complete', () => {
-      const state = { onboardingComplete: false, lastCheckInDate: null, schemaVersion: 2 };
+      const state = { onboardingComplete: false, lastHeartbeatDate: null, lastCheckInDate: null, heartbeatEnabled: false, schemaVersion: 5 };
       assert.equal(needsDailyCheckIn(state), false);
     });
 
     it('should trigger check-in if onboarding done and no check-in today', () => {
-      const state = { onboardingComplete: true, lastCheckInDate: '2020-01-01', schemaVersion: 2, dailyCheckInEnabled: true };
+      const state = { onboardingComplete: true, lastHeartbeatDate: '2020-01-01', lastCheckInDate: '2020-01-01', heartbeatEnabled: true, dailyCheckInEnabled: true, schemaVersion: 5 };
       assert.equal(needsDailyCheckIn(state), true);
     });
 
     it('should not trigger check-in if already done today', () => {
       const today = getLocalDateString();
-      const state = { onboardingComplete: true, lastCheckInDate: today, schemaVersion: 2, dailyCheckInEnabled: true };
+      const state = { onboardingComplete: true, lastHeartbeatDate: today, lastCheckInDate: today, heartbeatEnabled: true, dailyCheckInEnabled: true, schemaVersion: 5 };
       assert.equal(needsDailyCheckIn(state), false);
     });
 
-    it('onboarding day should skip daily check-in (lastCheckInDate set)', () => {
+    it('onboarding day should skip daily check-in (lastHeartbeatDate set)', () => {
       const today = getLocalDateString();
-      const state = { onboardingComplete: true, lastCheckInDate: today, schemaVersion: 2, dailyCheckInEnabled: true };
+      const state = { onboardingComplete: true, lastHeartbeatDate: today, lastCheckInDate: today, heartbeatEnabled: true, dailyCheckInEnabled: true, schemaVersion: 5 };
       assert.equal(needsDailyCheckIn(state), false);
     });
 
-    it('should not trigger check-in if dailyCheckInEnabled is not set (default off)', () => {
-      const state = { onboardingComplete: true, lastCheckInDate: '2020-01-01', schemaVersion: 3 };
+    it('should not trigger check-in if heartbeatEnabled is not set (default off)', () => {
+      const state = { onboardingComplete: true, lastHeartbeatDate: '2020-01-01', lastCheckInDate: '2020-01-01', heartbeatEnabled: false, schemaVersion: 5 };
       assert.equal(needsDailyCheckIn(state), false);
     });
   });
@@ -268,25 +348,82 @@ describe('Assistant Workspace', () => {
       migrateStateV1ToV2(workDir);
 
       const state = loadState(workDir);
-      assert.equal(state.schemaVersion, 4);
+      assert.equal(state.schemaVersion, 5);
       assert.ok(fs.existsSync(path.join(workDir, 'memory', 'daily')));
       assert.ok(fs.existsSync(path.join(workDir, 'Inbox')));
     });
 
-    it('should not re-migrate v4 state', () => {
+    it('should not re-migrate v5 state', () => {
       initializeWorkspace(workDir);
       const state = loadState(workDir);
-      assert.equal(state.schemaVersion, 4);
+      assert.equal(state.schemaVersion, 5);
 
       // Should not throw or change anything
       migrateStateV1ToV2(workDir);
       const reloaded = loadState(workDir);
-      assert.equal(reloaded.schemaVersion, 4);
+      assert.equal(reloaded.schemaVersion, 5);
     });
   });
 
   describe('budget-aware prompt assembly', () => {
-    it('should include daily memories in prompt', () => {
+    it('can omit only Claude-native rules while retaining neutral identity files', () => {
+      fs.writeFileSync(path.join(workDir, 'CLAUDE.md'), '# Native Claude rules', 'utf-8');
+      fs.writeFileSync(path.join(workDir, 'soul.md'), '# Soul\nKeep this identity.', 'utf-8');
+      const files = loadWorkspaceFiles(workDir);
+      const prompt = assembleWorkspacePrompt(files, undefined, { omitRules: true });
+      assert.ok(!prompt.includes('Native Claude rules'));
+      assert.ok(prompt.includes('Keep this identity.'));
+    });
+
+    it('renders canonical rules under a framework-neutral prompt role', () => {
+      initializeWorkspace(workDir);
+      const prompt = assembleWorkspacePrompt(loadWorkspaceFiles(workDir));
+      assert.match(prompt, /<instructions>[\s\S]*?<\/instructions>/);
+      assert.doesNotMatch(prompt, /<claude>/);
+    });
+
+    it('keeps canonical rules in Codex developerInstructions even with a synced AGENTS.md mirror', () => {
+      initializeWorkspace(workDir);
+      fs.writeFileSync(path.join(workDir, 'instructions.md'), '# Codex delivery marker\n', 'utf8');
+      reconcileInstructionMirrors(workDir);
+      const files = loadWorkspaceFiles(workDir);
+
+      assert.equal(files.rulesFileNativeCodex, true);
+      assert.equal(shouldOmitCanonicalRules('codex_runtime', files), false);
+      const prompt = assembleWorkspacePrompt(files, undefined, {
+        omitRules: shouldOmitCanonicalRules('codex_runtime', files),
+      });
+      assert.match(prompt, /Codex delivery marker/);
+    });
+
+    it('injects canonical rules during a native mirror conflict and preserves the user mirror', () => {
+      initializeWorkspace(workDir);
+      fs.appendFileSync(path.join(workDir, 'CLAUDE.md'), '\n# User conflict rule\n', 'utf8');
+      const files = loadWorkspaceFiles(workDir);
+
+      assert.equal(shouldOmitCanonicalRules('claude_code', files), false);
+      assert.match(
+        assembleWorkspacePrompt(files, undefined, {
+          omitRules: shouldOmitCanonicalRules('claude_code', files),
+        }),
+        /Memory Rules/,
+      );
+      assert.match(fs.readFileSync(path.join(workDir, 'CLAUDE.md'), 'utf8'), /User conflict rule/);
+    });
+
+    it('treats CRLF-only mirror rewrites as synced rather than a user-content conflict', () => {
+      initializeWorkspace(workDir);
+      for (const fileName of ['CLAUDE.md', 'AGENTS.md']) {
+        const filePath = path.join(workDir, fileName);
+        fs.writeFileSync(filePath, fs.readFileSync(filePath, 'utf8').replace(/\n/g, '\r\n'), 'utf8');
+      }
+
+      const inspection = inspectInstructionMirrors(workDir);
+      assert.deepEqual(inspection.conflicts, []);
+      assert.ok(inspection.mirrors.every((mirror) => mirror.status === 'synced'));
+    });
+
+    it('should only include identity files in prompt (memory accessed via MCP)', () => {
       initializeWorkspace(workDir);
       fs.writeFileSync(path.join(workDir, 'soul.md'), '# Soul\nI am helpful.', 'utf-8');
       writeDailyMemory(workDir, '2024-03-06', '# Today\nDid coding.');
@@ -295,11 +432,12 @@ describe('Assistant Workspace', () => {
       const prompt = assembleWorkspacePrompt(files);
 
       assert.ok(prompt.includes('<assistant-workspace>'));
-      assert.ok(prompt.includes('I am helpful'));
-      assert.ok(prompt.includes('Did coding'));
+      assert.ok(prompt.includes('I am helpful'), 'soul.md should be in prompt');
+      // Daily memories are no longer in system prompt — accessed via codepilot_memory_search MCP
+      assert.ok(!prompt.includes('Did coding'), 'daily memories should NOT be in prompt');
     });
 
-    it('should include retrieval results in prompt', () => {
+    it('should not include retrieval results in prompt (accessed via MCP)', () => {
       initializeWorkspace(workDir);
       fs.writeFileSync(path.join(workDir, 'soul.md'), '# Soul\nI am helpful.', 'utf-8');
 
@@ -307,10 +445,12 @@ describe('Assistant Workspace', () => {
       const results = [
         { path: 'notes/test.md', heading: 'Test', snippet: 'Some test content', score: 15, source: 'title' as const },
       ];
-      const prompt = assembleWorkspacePrompt(files, results);
+      // assembleWorkspacePrompt no longer accepts retrieval results
+      const prompt = assembleWorkspacePrompt(files);
 
-      assert.ok(prompt.includes('retrieval-result'));
-      assert.ok(prompt.includes('Some test content'));
+      assert.ok(!prompt.includes('retrieval-result'), 'retrieval results should NOT be in prompt');
+      assert.ok(!prompt.includes('Some test content'), 'retrieval content should NOT be in prompt');
+      void results; // suppress unused variable warning
     });
 
     it('should respect total prompt limit', () => {
@@ -339,15 +479,8 @@ describe('Assistant Workspace', () => {
       assert.ok(fs.existsSync(path.join(workDir, 'PATH.ai.md')));
     });
 
-    it('should include root docs in loaded files', () => {
-      initializeWorkspace(workDir);
-      fs.mkdirSync(path.join(workDir, 'notes'));
-      generateRootDocs(workDir);
-
-      const files = loadWorkspaceFiles(workDir);
-      assert.ok(files.rootReadme, 'Should have rootReadme');
-      assert.ok(files.rootPath, 'Should have rootPath');
-    });
+    // Root docs are now accessed via MCP tools, not loaded into workspace files.
+    // The generateRootDocs function still works; we just don't load them into files.
   });
 });
 
@@ -578,7 +711,7 @@ describe('saveState is atomic (write-then-rename)', () => {
     initializeWorkspace(workDir2);
     const state = loadState(workDir2);
     state.onboardingComplete = true;
-    state.lastCheckInDate = getLocalDateString();
+    state.lastHeartbeatDate = getLocalDateString();
     saveState(workDir2, state);
 
     // Read raw file to verify it's valid JSON
@@ -612,5 +745,6 @@ describe('saveState is atomic (write-then-rename)', () => {
 describe('cleanup', () => {
   it('close db', () => {
     closeDb();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });

@@ -2,7 +2,7 @@
 
 ## 核心思路
 
-让用户通过 Telegram（后续可扩展 Discord/飞书等）远程操控 CodePilot 中的 Claude 会话。复用现有 `streamClaude()` 管线，在服务端消费 SSE 流，而非通过浏览器。
+让用户通过 Telegram、Discord、飞书、微信等 IM 通道远程操控 CodePilot 中的 Claude 会话。Bridge 复用现有 `streamClaude()` 管线，在服务端直接消费 SSE 流，而不是依赖浏览器标签页。
 
 ## 目录结构
 
@@ -12,9 +12,10 @@ src/lib/bridge/
 ├── channel-adapter.ts       # 抽象基类 + adapter 注册表（registerAdapterFactory/createAdapter）
 ├── channel-router.ts        # (channel, user, thread) → session 映射，自动创建/绑定会话
 ├── conversation-engine.ts   # 服务端消费 streamClaude() SSE 流，保存消息到 DB，onPartialText 流式回调
-├── permission-broker.ts     # 权限请求转发到 IM 内联按钮，处理回调审批
+├── permission-broker.ts     # 权限请求转发到 IM 内联按钮，处理回调审批（含 AskUserQuestion ask: 卡片）
 ├── delivery-layer.ts        # 出站消息分片、限流、重试退避、HTML 降级
 ├── bridge-manager.ts        # 生命周期编排，adapter 事件循环，流式预览状态机，deliverResponse 渲染分发
+├── feishu-app-registration.ts # 飞书 App Registration 设备流（begin/poll/cancel + globalThis session）
 ├── markdown/
 │   ├── ir.ts                # Markdown → IR 中间表示解析器（基于 markdown-it）
 │   ├── render.ts            # IR → 格式化输出的通用标记渲染器
@@ -24,6 +25,13 @@ src/lib/bridge/
 │   ├── telegram-adapter.ts  # Telegram 长轮询 + offset 安全水位 + 图片/相册处理 + 自注册
 │   ├── telegram-media.ts    # Telegram 图片下载、尺寸选择、base64 转换
 │   ├── telegram-utils.ts    # callTelegramApi / sendMessageDraft / escapeHtml / splitMessage
+│   ├── weixin-adapter.ts    # 微信多账号长轮询 + batch ack + 纯文本出站 + 自注册
+│   ├── weixin/
+│   │   ├── weixin-api.ts    # 微信 ilink 协议客户端（getupdates/sendmessage/sendtyping/getconfig）
+│   │   ├── weixin-auth.ts   # 二维码登录 + HMR 安全会话存储
+│   │   ├── weixin-media.ts  # AES-128-ECB 媒体解密/上传
+│   │   ├── weixin-ids.ts    # synthetic chatId 编解码（weixin::<accountId>::<peerUserId>）
+│   │   └── weixin-session-guard.ts # errcode -14 暂停保护
 │   ├── feishu-adapter.ts    # 薄代理 → ChannelPluginAdapter(FeishuChannelPlugin)
 │   └── discord-adapter.ts   # Discord.js Client + Gateway intents + 按钮交互 + 流式预览 + 自注册
 ├── markdown/
@@ -36,15 +44,16 @@ src/lib/channels/
 ├── types.ts                 # ChannelPlugin / ChannelCapabilities / CardStreamController / ToolCallInfo 接口
 ├── channel-plugin-adapter.ts # ChannelPlugin → BaseChannelAdapter 桥接
 └── feishu/
-    ├── index.ts             # FeishuChannelPlugin 组合入口
+    ├── index.ts             # FeishuChannelPlugin 组合入口 + bot identity 解析 + generation guard
     ├── types.ts             # FeishuConfig / CardStreamConfig / FeishuBotInfo 等内部类型
     ├── config.ts            # 从 settings DB 加载配置 + 校验
-    ├── gateway.ts           # WSClient 生命周期 + card.action.trigger monkey-patch + 超时保护
-    ├── inbound.ts           # 入站消息解析 + 内容提取 + 资源下载
-    ├── outbound.ts          # 出站消息渲染（post md / interactive card / reaction）+ Markdown 优化
+    ├── gateway.ts           # WSClient 生命周期（含 force close）+ card.action.trigger monkey-patch + 超时保护
+    ├── inbound.ts           # 入站消息解析 + 多消息类型提取（text/image/file/audio/video）+ @mention 检测
+    ├── outbound.ts          # 出站消息渲染（post md / interactive card / reaction）+ Markdown 优化 + 指数退避重试
     ├── policy.ts            # 用户授权 + DM/群聊策略
-    ├── identity.ts          # Bot 身份解析 + @mention 检测
-    └── card-controller.ts   # CardKit v2 流式卡片（create/update/finalize/thinking/toolCalls）
+    ├── identity.ts          # Bot 身份解析
+    ├── card-controller.ts   # CardKit v2 流式卡片（create/update/finalize/thinking/toolCalls）
+    └── resource-downloader.ts # im.messageResource.get 下载器（20MB 限制 + 2 次重试）
 ```
 
 ## 数据流
@@ -110,39 +119,76 @@ Discord 消息 → discord.js Client (Gateway WebSocket)
 - **授权默认拒绝**：空白允许列表 = 拒绝所有（安全优先，同飞书模式）
 - **`!` 命令别名**：在 adapter 层规范化为 `/` 命令后入队——bridge-manager 命令处理器无需改动
 
-### WeChat Adapter
+### 微信（Native BaseChannelAdapter + 多账号长轮询）
 
-**Architecture**: Native `BaseChannelAdapter` implementation using HTTP long-polling.
+```
+微信消息 → WeixinAdapter.runPollLoop(account)
+  → getupdates(long-poll, get_updates_buf)
+  → context_token 落库(weixin_context_tokens)
+  → 媒体解密(AES-128-ECB，可按设置关闭)
+  → synthetic chatId = weixin::<accountId>::<peerUserId>
+  → enqueue(InboundMessage, updateId=batchId)
+  → BridgeManager.runAdapterLoop() → handleMessage()
+    → channel-router.resolve() 自愈坏 cwd / stale sdkSessionId
+    → conversation-engine.processMessage() 用有效 cwd 调 streamClaude()
+    → permission_request → `/perm allow|allow_session|deny <id>` 文本降级
+    → deliverResponse() 纯文本分片(4096 chars, 最多 5 段)
+      → sendmessage({ msg, base_info })
+  → handleMessage() finally
+    → adapter.acknowledgeUpdate(batchId)
+    → batch sealed + remaining=0
+    → channel_offsets["weixin:<accountId>"] = get_updates_buf
+```
 
-**Key files**:
-- `src/lib/bridge/adapters/weixin-adapter.ts` — Main adapter (multi-account worker model)
-- `src/lib/bridge/adapters/weixin/weixin-api.ts` — HTTP protocol client
-- `src/lib/bridge/adapters/weixin/weixin-auth.ts` — QR code login flow
-- `src/lib/bridge/adapters/weixin/weixin-media.ts` — AES-128-ECB media encryption/decryption
-- `src/lib/bridge/adapters/weixin/weixin-ids.ts` — Synthetic chatId encode/decode
-- `src/lib/bridge/adapters/weixin/weixin-session-guard.ts` — Account pause management
+**关键文件**
+- `src/lib/bridge/adapters/weixin-adapter.ts`：微信主 adapter。每个启用账号一个 poll worker，负责入站标准化、batch ack、typing、纯文本出站。
+- `src/lib/bridge/adapters/weixin/weixin-api.ts`：协议客户端。对齐 OpenClaw 微信插件协议，但不把其 npm 包作为运行时依赖。
+- `src/lib/bridge/adapters/weixin/weixin-auth.ts`：二维码登录，使用 `globalThis` 保存活跃登录会话以穿过 Next.js HMR。
+- `src/lib/bridge/adapters/weixin/weixin-media.ts`：微信 CDN 媒体下载/上传的 AES-128-ECB 加解密。
+- `src/lib/bridge/adapters/weixin/weixin-ids.ts`：`weixin::<accountId>::<peerUserId>` synthetic chatId 编解码。
+- `src/lib/bridge/adapters/weixin/weixin-session-guard.ts`：`errcode = -14` 会话失效时暂停账号 60 分钟，避免无限重试。
 
-**Multi-account model**: Each QR-linked WeChat account runs its own long-polling worker. Accounts are stored in the `weixin_accounts` table. The adapter uses synthetic chatId format `weixin::<accountId>::<peerUserId>` to isolate conversations across accounts without modifying the `channel_bindings` schema.
+**为什么用 synthetic chatId**
+- 微信 bridge 需要多账号并存，但 `channel_bindings` 表没有单独的 account 维度。
+- 方案是把账号隔离编码进 chatId：`weixin::<accountId>::<peerUserId>`。
+- 这样 `channel-router`、`permission-broker`、`delivery-layer` 和审计日志都可以继续复用原来的单 chat 抽象，不需要额外改 schema。
 
-**Data persistence**:
-- `weixin_accounts` — Bot credentials, base URLs, enabled status
-- `weixin_context_tokens` — Per-(account, peer) context tokens (required for sending messages)
-- `channel_offsets` with key `weixin:<accountId>` — Long-poll cursor (`get_updates_buf`)
+**数据持久化**
+- `weixin_accounts`：账号凭据、bot token、base URL、启用状态、最后登录时间。
+- `weixin_context_tokens`：按 `(account_id, peer_user_id)` 持久化 `context_token`。这是微信主动回消息的硬前置条件，不能只放内存。
+- `channel_offsets`：使用 key `weixin:<accountId>` 保存每个账号各自的 `get_updates_buf`。
 
-**Authentication**: QR code login via WeChat ilink bot API. The QR login flow is managed by `weixin-auth.ts` with active sessions stored in `globalThis` to survive Next.js HMR. Login results are persisted to `weixin_accounts`.
+**二维码登录与运行时刷新**
+- `/api/settings/weixin/login/start` 生成二维码；服务端读取微信返回的 `qrcode_img_content` URL，再用 `qrcode` 渲染为 data URL，前端无需额外跳转或依赖外链图片。
+- `/api/settings/weixin/login/wait` 轮询扫码状态。状态变成 `confirmed` 后，账号会落库到 `weixin_accounts`，并在 bridge 正在运行时自动调用 `bridge-manager.restart()`，让新账号立即加入 worker 池。
+- 账号启用/停用/删除也会走同样的 restart 流程；如果 DB 改动成功但 runtime 重启失败，API 会显式返回错误，前端 toast 告知“已保存但运行态未切换”。
 
-**Message flow**:
-- Inbound: `getUpdates` long-poll → message standardization → context_token persistence → media decryption → `InboundMessage` queue
-- Outbound: Decode synthetic chatId → retrieve context_token from DB → `sendTextMessage` (plain text only)
+**出站协议与成功判定**
+- `sendmessage` 请求体必须是 `{ msg, base_info }`，其中 `msg` 包含 `to_user_id`、`client_id`、`message_type`、`message_state`、`item_list`、`context_token`。
+- 不能依赖服务端返回 `message_id` 判成功。当前实现本地生成 `client_id`，HTTP 成功即视为投递成功，并把 `client_id` 作为 bridge 层的 `messageId`。
+- 微信只支持纯文本出站，所以 `bridge-manager.deliverResponse()` 会先做纯文本分片。Markdown / HTML 不走专门渲染器。
 
-**Media**: AES-128-ECB encryption for CDN upload/download. Inbound media (images, files, videos, voice) is decrypted and converted to `FileAttachment`. Outbound media is text-only in this version.
+**cursor / ack 语义**
+- 微信 worker 读到 `get_updates_buf` 后不会立即写库，而是先给本批消息分配 `batchId`。
+- 每条消息处理完成后，`bridge-manager.handleMessage()` 在 `finally` 中调用 `adapter.acknowledgeUpdate(batchId)`。
+- 只有当该 batch 被 `sealed` 且 `remaining = 0` 时，才真正把 cursor 提交到 `channel_offsets`。
+- 这样即使 Claude 处理、权限审批或微信出站在中途失败，也不会把上游 cursor 提前推进，避免静默丢消息。
 
-**Known limitations**:
-- Private chat only (no groups)
-- No streaming preview (WeChat doesn't support message editing)
-- No inline buttons (permissions use `/perm` text fallback)
-- Session expiry (errcode -14) pauses account for 60 minutes
-- Real QR code scanning requires a WeChat account with ilink bot access
+**cwd 自愈与 resume 清理**
+- 微信实现过程中补齐了 bridge 的 cwd 自愈链：`session.sdk_cwd` → `binding.workingDirectory` → `session.working_directory` → `bridge_default_work_dir` → `HOME/process cwd`。
+- `channel-router.resolve()` 会在每次消息到来时校验目录是否存在，并在回退到默认目录/Home 时清空 binding/session 上的 `sdk_session_id`，避免拿坏会话强行 resume。
+- `conversation-engine` 与 `claude-client` 也会再做一层防线：如果 cwd 已回退，不再尝试 resume 旧 Claude session。
+
+**typing / 媒体 / 权限**
+- typing 是 best-effort：先用 `getconfig(ilink_user_id, context_token)` 取 `typing_ticket`，再调用 `sendtyping`。失败不影响主流程。
+- 入站媒体可按 `bridge_weixin_media_enabled` 开关控制。开启时会把图片/文件/视频/语音下载、解密并转换成 `FileAttachment`，复用现有 vision / 文件上下文管线。
+- 微信没有按钮和消息编辑能力，权限审批统一降级为文本命令：`/perm allow|allow_session|deny <permission_request_id>`。
+
+**当前限制**
+- 仅支持私聊，不支持群聊语义。
+- 不支持流式预览；微信端无法像 Telegram/飞书那样持续编辑同一条消息。
+- 当前版本只做文本出站，AI 主动发图/发文件尚未接通。
+- 真实扫码联调依赖具备 ilink bot 权限的微信账号。
 
 ### Telegram
 
@@ -259,12 +305,71 @@ Claude 的回复是 Markdown 格式，Telegram 仅支持有限 HTML 标签（b/i
 **19. Telegram 通知模式互斥**
 `telegram-bot.ts` 的通知功能（UI 会话通知）与 bridge 模式互斥。通过 `globalThis.__codepilot_bridge_mode_active` 标志协调（存 globalThis 防 HMR 重置）。Bridge 启动时设 `true`，4 个 notify 函数检查此标志后提前返回。
 
-## 设置项（settings 表）
+**20. 微信 `context_token` 必须持久化**
+微信不是“只靠 chatId 就能主动回消息”的协议。`sendmessage` 依赖最近一次入站消息带来的 `context_token`，所以必须把 `(account_id, peer_user_id) -> context_token` 持久化到 `weixin_context_tokens`。只放内存会在进程重启后导致“能收消息、不能回消息”。
+
+**21. 坏 cwd 不能继续 resume Claude 会话**
+Bridge 绑定和 chat session 中可能残留已经删除的 `working_directory` / `sdk_cwd`。一旦用坏目录继续携带旧 `sdk_session_id` 调 `streamClaude()`，Claude 子进程会在错误项目上下文里瞬间退出。当前修复要求在 cwd 回退时同步清空 binding/session 的 `sdk_session_id`，并把修正后的 cwd 回写 DB。
+
+**22. 飞书一键创建应用（App Registration Device Flow）**
+`src/lib/bridge/feishu-app-registration.ts` 用飞书官方 CLI 同款的 `POST accounts.feishu.cn/oauth/v1/app/registration` 设备流，配合 `archetype=PersonalAgent` 让服务端自动配置 Bot 能力、IM scope、事件订阅、长连接模式，省去开放平台后台手动操作。
+- **流程**：前端调 `POST /api/bridge/feishu/register/start` 拿到 session_id + verification_url → `window.open()` 跳转浏览器 → 用户确认 → 前端轮询 `POST /api/bridge/feishu/register/poll` → 拿到 `client_id`/`client_secret` 写入 DB → 自动测试连接 → 运行中的桥接触发 restart
+- **session 状态机**：存 `globalThis.__feishu_registration_sessions__`（HMR 安全），状态 `waiting / completed / failed / expired`
+- **slow_down 退避**：服务端把 `session.interval` 通过 `interval_ms` 返回给前端，前端用 `setTimeout` 递归调度（非 setInterval）动态调整轮询间隔
+- **Lark 回切**：轮询响应的 `tenant_brand=lark` 且 `client_secret` 为空时，把 `session.domain` 切到 `lark` 后续轮询直接走 `accounts.larksuite.com`，支持 Lark 侧的 `authorization_pending` / `slow_down` 继续等待
+- **错误码契约**：后端返回结构化 `error_code`（`timeout` / `user_denied` / `empty_credentials` / `lark_empty_credentials`），前端按 i18n map 映射到中文提示
+- **Cancel 语义**：新增 `POST /api/bridge/feishu/register/cancel` 让前端取消时同步清理服务端 session，避免浏览器侧晚到的确认创建出孤儿应用
+- **前端轮询竞态**：`FeishuBridgeSection.tsx` 用 AbortController + 单调递增 `regRunIdRef` 双重保护：cancel 后 in-flight fetch 被 abort，所有 state 更新/schedulePoll 前都检查 generation 是否过期
+- **UI 降级**：`verify_error` 或 `bridge_restart_error` 不再渲染为 success，而是 `warning`（凭据已存但运行时有问题）；非 2xx 响应直接终止本轮，不 fallthrough 到重试
+
+**23. 飞书授权策略执行（Authorization Enforcement）**
+之前 `dmPolicy` / `groupPolicy` / `allowFrom` / `groupAllowFrom` 这套设置在飞书上是死代码——`FeishuChannelPlugin` 的 message handler 和 card action handler 都没调 `isUserAuthorized()`。现在：
+- **入站消息 gate**：`channels/feishu/index.ts` messageHandler 在 enqueue 前调 `isUserAuthorized(this.config!, addrUserId, rawChatId)`，未授权直接 drop 并记日志
+- **卡片回调 gate**：`channels/feishu/index.ts` cardActionHandler 拒绝未授权用户点击按钮（返回 "无权限操作" toast，不 enqueue 驱动任何动作），防止白名单外用户通过点击历史卡片审批权限或切换项目
+- **thread-session 地址兼容**：授权检查前用 `split(':thread:')[0]` 剥离 thread 后缀，因为 `groupAllowFrom` 存的是原始 `oc_xxx`，不剥离会让 `threadSession=true` 的群聊全部误拦
+
+**24. 飞书 bot identity 解析（@mention 支持基石）**
+`FeishuChannelPlugin` 启动后 fire-and-forget 调 `resolveBotIdentity()`，通过 `getBotInfo()`（`/bot/v3/info/` REST API）拿 `open_id`，用于 `inbound.ts` 的 @mention 检测（#384 requireMention 群聊过滤）。
+- **Fail-open 启动窗口**：`inbound.ts` 在 `botOpenId` 为空时跳过 requireMention 检查，避免启动 1-5s 内群消息被全部误拦（而不是 fail-closed）
+- **3 次快速重试**：2s/4s/6s backoff，成功即停
+- **60s 后台周期重试**：3 次都失败后启动 setInterval，解决运行期间飞书 API 偶发抖动导致 requireMention 永久失效的问题
+- **Generation guard**：`identityGeneration` 计数器在 `start()` / `stop()` 时 +1，所有 in-flight probe 和定时器 callback 在每次 `await` 前后检查 generation 匹配，不匹配就 bail 并自清 timer（timer 用闭包捕获的 `myTimer` 对象，不通过 `this.identityRetryTimer` 字段查找，避免 stale callback 误清新 generation 的 timer）
+
+**25. 飞书 WSClient 真正关闭**
+`channels/feishu/gateway.ts:181` 原来只把 `this.wsClient = null`，靠 SDK 自己断开——实际 SDK 的 ping/reconnect timer + WebSocket 实例都还活着，幽灵连接会在桥接重启或 Feishu 重绑时导致重复消息投递。现在调 `WSClient.close({ force: true })`（SDK `lib/index.js:85594` 实现），会 `clearTimeout` ping interval + reconnect interval、`removeAllListeners` + `wsInstance.terminate()`。
+
+**26. 全局 Bridge stop 中断 active tasks**
+`bridge-manager.stop()` 原来只 abort 事件循环就 `state.activeTasks.clear()`，正在跑的 Claude 会话依然在后台继续写 DB / 占 session lock。现在 stop 先遍历 `state.activeTasks` 对每个 AbortController 调 `.abort()`，对齐 per-session `/stop` 命令语义。
+
+**27. 飞书 AskUserQuestion 交互卡片**
+`permission-broker.ts` 从统一 deny 改为按 channel 能力分支：
+- **支持按钮的 channel**（Telegram / Discord / 飞书）：`buildAskUserQuestionCard()` 渲染带选项按钮的卡片，callback 格式 `ask:{requestId}:{optionIndex}`；`handleAskUserQuestionCallback()` 用 `updatedInput = { questions, answers: { [question]: label } }` 回填给 `AskUserQuestion` 工具，匹配 native 工具契约
+- **不支持按钮的 channel**（QQ / Weixin）：明确 deny 而非 degrade 到 Allow/Deny（后者会让工具以空 answers 执行返回"The user did not provide any answers"）
+- **严格 validation**：`validateAskUserQuestion()` 拒绝多 question（`questions.length > 1`）、`multiSelect=true`、空 options 三种形态，附带人类可读的原因，让模型能重新组织调用而非静默截断
+- **full_access 不自动审批**：AskUserQuestion 的用户选择携带语义，不只是权限同意，所以即使 `full_access` profile 也要走正常 UI 流程
+- **飞书卡片样式**：`outbound.ts` 识别 `ask:` 前缀渲染 indigo "Question" header + comment icon（区别于 perm: 的 blue "Permission Required" + lock icon）
+- **bridge-manager 路由**：`ask:` 回调走 `handleAskUserQuestionCallback` 且**不**发 "Permission response recorded" 确认消息（模型的下一条回复本身就是对用户选择的回应）
+
+**28. 飞书资源消息支持（image/file/audio/video）**
+`inbound.ts` 扩展非文本消息处理：`extractResources()` 从 `message.content` JSON 解析 `file_key` + `resourceType`，返回 `PendingResource[]`；`parseMessageWithResources()` 同时返回 base message + pending resources。`FeishuChannelPlugin.downloadAndEnqueue()` 在 gateway handler 外 fire-and-forget 做下载，不阻塞 WSClient。
+- **下载器**：`channels/feishu/resource-downloader.ts` 封装 `im.messageResource.get`，带 20MB 上限 + 2 次指数退避重试；permanent error（not-found / permission）不重试直接返回 null
+- **支持类型**：`image`（`image/png`）、`file`（`application/octet-stream`）、`audio`（`audio/ogg`）、`video`（`video/mp4`）；`media` 被当作 `video` 处理
+- **partial failure 容忍**：部分资源下载失败仍然 enqueue 已成功的 attachments + 原文本
+- **类型感知 fallback prompt**：`bridge-manager.handleMessage()` 在 text 为空且有 attachments 时按类型选提示语（纯图 `Describe this image` / 纯音 `Transcribe and summarize this audio` / 纯视频 `Describe what happens in this video` / 混合或文件 `Please review the attached file(s)`），不再硬编码 `Describe this image.`
+- **历史回放二进制防护**：`message-builder.ts` 用 `isTextLikeMime()` 判断后才 `readFileSync(..., 'utf-8')` 内联，否则只插一行 `[Attached file: name (mime, binary — content not inlined; path: ...)]` 引用备注，避免 audio/video 二进制字节被当乱码文本注入 prompt
+
+**29. 飞书出站消息重试（#266）**
+`outbound.ts` 的 `sendMessage()` 包裹 2 次指数退避重试。`isTransientError()` 识别 Feishu 永久错误码（99991663/99991664/10003/230001/230002）提前 fail，timeout/network/5xx 继续重试。
+
+**30. 飞书 thread-session 守卫（#321）**
+`inbound.ts` 之前无条件把 `root_id` 拼进 `chatId` 做 thread 路由，`bridge_feishu_thread_session` 设置其实无效（永远开启）。现在检查 `config.threadSession && rootId` 才做 synthetic address，默认关闭时所有消息共享同一 session，和产品预期一致。
 
 | Key | 说明 |
 |-----|------|
 | remote_bridge_enabled | 总开关 |
 | bridge_telegram_enabled | Telegram 通道开关 |
+| bridge_weixin_enabled | 微信通道开关 |
+| bridge_weixin_media_enabled | 微信入站媒体下载开关（默认 true；关闭后只收文本） |
 | bridge_auto_start | 服务启动时自动拉起桥接 |
 | bridge_default_work_dir | 新建会话默认工作目录 |
 | bridge_default_model | 新建会话默认模型 |
@@ -296,6 +401,14 @@ Claude 的回复是 Markdown 格式，Telegram 仅支持有限 HTML 标签（b/i
 | /api/bridge | POST | `{ action: 'start' \| 'stop' \| 'auto-start' }` |
 | /api/bridge/channels | GET | 列出活跃通道（支持 `?active=true/false` 过滤） |
 | /api/bridge/settings | GET/PUT | 读写 bridge 设置 |
+| /api/settings/weixin | GET/PUT | 读写微信全局设置（当前仅开关和媒体选项） |
+| /api/settings/weixin/accounts | GET | 列出微信账号（token 脱敏，只返回 `has_token`） |
+| /api/settings/weixin/accounts/[accountId] | PATCH/DELETE | 启停或删除微信账号；bridge 运行中会同步 restart |
+| /api/settings/weixin/login/start | POST | 创建二维码登录会话并返回二维码图片 |
+| /api/settings/weixin/login/wait | POST | 轮询二维码状态；确认后自动尝试重启 bridge |
+| /api/bridge/feishu/register/start | POST | 启动飞书 App Registration 设备流，返回 session_id + verification_url |
+| /api/bridge/feishu/register/poll | POST | 轮询注册状态；completed 后验证凭据 + 自动重启 bridge；返回 interval_ms 让前端响应 slow_down |
+| /api/bridge/feishu/register/cancel | POST | 取消注册 session（服务端清理，避免浏览器侧晚到确认产生孤儿应用） |
 
 ## Telegram 命令
 
@@ -315,10 +428,16 @@ Claude 的回复是 Markdown 格式，Telegram 仅支持有限 HTML 标签（b/i
 - `src/lib/telegram-bot.ts` — 通知模式（UI 发起会话的通知），与 bridge 模式互斥
 - `src/lib/permission-registry.ts` — 权限 Promise 注册表，bridge 和 UI 共用
 - `src/lib/claude-client.ts` — streamClaude()，bridge 和 UI 共用
-- `src/components/bridge/BridgeSection.tsx` — Bridge 设置 UI（一级导航 /bridge），含 Telegram/飞书通道开关
-- `src/components/bridge/BridgeLayout.tsx` — 侧边栏导航（Telegram + Feishu 入口）
+- `src/components/bridge/BridgeSection.tsx` — Bridge 设置 UI（一级导航 /bridge），含 Telegram/微信/飞书通道开关
+- `src/components/bridge/BridgeLayout.tsx` — 侧边栏导航（Telegram / 微信 / 飞书 入口）
 - `src/components/bridge/TelegramBridgeSection.tsx` — Telegram 凭据 + 白名单设置 UI（/bridge#telegram）
+- `src/components/bridge/WeixinBridgeSection.tsx` — 微信设置 UI：账号列表、二维码登录、运行态错误提示（/bridge#weixin）
 - `src/components/bridge/FeishuBridgeSection.tsx` — 飞书设置 UI：凭据 + 访问与行为（2 卡片 2 保存按钮 + 脏状态追踪）
+- `src/app/api/settings/weixin/route.ts` — 微信全局设置 API（当前仅 `bridge_weixin_enabled` / `bridge_weixin_media_enabled`）
+- `src/app/api/settings/weixin/accounts/route.ts` — 微信账号列表 API
+- `src/app/api/settings/weixin/accounts/[accountId]/route.ts` — 微信账号启停/删除 API（带 bridge restart 语义）
+- `src/app/api/settings/weixin/login/start/route.ts` — 微信二维码登录启动 API
+- `src/app/api/settings/weixin/login/wait/route.ts` — 微信二维码状态轮询 API（confirmed 后自动 restart bridge）
 - `src/app/api/settings/feishu/route.ts` — 飞书设置读写 API（简化后 10 个 key）
 - `src/app/api/settings/feishu/verify/route.ts` — 飞书凭据验证 API（测试 token 获取 + bot info）
 - `src/lib/channels/` — V2 ChannelPlugin 架构（见目录结构）

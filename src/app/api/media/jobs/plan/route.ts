@@ -57,12 +57,13 @@ export async function POST(request: NextRequest) {
     }
 
     const resolved = resolveProvider({
+      callScene: 'media_plan',
       sessionProviderId: session?.provider_id || undefined,
       sessionModel: session?.model || undefined,
     });
     // Preserve 'env' semantics (see onboarding route for rationale)
     const providerId = resolved.provider?.id || 'env';
-    const modelId = resolved.upstreamModel || resolved.model || session?.model || 'claude-sonnet-4-20250514';
+    const modelId = resolved.upstreamModel || resolved.model || session?.model || 'claude-sonnet-4-6';
 
     // Read document content
     let docContent = body.docContent || '';
@@ -106,6 +107,7 @@ ${docContent ? `Document content:\n${docContent}` : 'No document provided — ge
           let fullText = '';
 
           for await (const chunk of streamTextFromProvider({
+            callScene: 'media_plan',
             providerId,
             model: modelId,
             system: PLANNER_SYSTEM_PROMPT,

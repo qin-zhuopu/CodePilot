@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react';
 import type { Message, FileAttachment } from '@/types';
-import { getLocalDateString } from '@/lib/utils';
+// getLocalDateString removed — heartbeat no longer auto-triggers
 import { startStream } from '@/lib/stream-session-manager';
 
 // ── localStorage heartbeat for cross-tab liveness detection ──
@@ -73,12 +73,23 @@ interface UseAssistantTriggerOpts {
   workingDirectory?: string;
   isStreaming: boolean;
   mode: string;
-  currentModel: string;
-  currentProviderId: string;
+  /**
+   * Runtime-filtered resolved pair from useProviderModels. Auto-trigger
+   * uses these (not the raw currentModel/currentProviderId) so welcome /
+   * heartbeat messages flow through the same runtime gate as user-typed
+   * sends — otherwise a stale saved provider would silently route past
+   * the gate via env-default re-resolution at /api/chat.
+   */
+  resolvedModel: string;
+  resolvedProviderId: string;
+  noCompatibleProvider: boolean;
+  fetchState: 'idle' | 'loaded' | 'failed';
   initialMessages: Message[];
   handleModeChange: (mode: string) => void;
   buildThinkingConfig: () => { type: string } | undefined;
-  sendMessageRef: React.MutableRefObject<((content: string, files?: FileAttachment[]) => Promise<void>) | undefined>;
+  // Returns boolean | void — false means the send was gated/not delivered
+  // (#615 composer-preservation contract). Auto-trigger ignores the result.
+  sendMessageRef: React.MutableRefObject<((content: string, files?: FileAttachment[]) => Promise<boolean | void>) | undefined>;
   initMetaRef: React.MutableRefObject<{ tools?: unknown; slash_commands?: unknown; skills?: unknown } | null>;
 }
 
@@ -87,8 +98,10 @@ export function useAssistantTrigger({
   workingDirectory,
   isStreaming,
   mode,
-  currentModel,
-  currentProviderId,
+  resolvedModel,
+  resolvedProviderId,
+  noCompatibleProvider,
+  fetchState,
   initialMessages,
   handleModeChange,
   buildThinkingConfig,
@@ -118,6 +131,14 @@ export function useAssistantTrigger({
   const checkAssistantTrigger = useCallback(async () => {
     // Don't trigger if already streaming or already triggered in this mount
     if (isStreaming || assistantTriggerFiredRef.current) return;
+    // Don't trigger before the runtime-filtered picker feed has loaded —
+    // resolved pair would be the raw saved values, defeating the gate.
+    if (fetchState !== 'loaded') return;
+    // Don't trigger when no provider is compatible with the active runtime.
+    // Welcome / heartbeat would post a stale provider/model that the
+    // backend would silently re-resolve to env defaults.
+    if (noCompatibleProvider) return;
+    if (!resolvedProviderId || !resolvedModel) return;
 
     try {
       const res = await fetch('/api/settings/workspace');
@@ -164,59 +185,32 @@ export function useAssistantTrigger({
       }
       if (state.hookTriggeredSessionId === sessionId && initialMessages.length > 0) return;
 
-      const today = getLocalDateString();
       const needsOnboarding = !state.onboardingComplete;
-      const needsCheckIn = state.onboardingComplete && state.dailyCheckInEnabled === true && state.lastCheckInDate !== today;
 
-      if (!needsOnboarding && !needsCheckIn) return;
+      // Onboarding is now handled by the frontend Wizard component (OnboardingWizard.tsx).
+      if (needsOnboarding) return;
 
-      // ── Compensation: check if a past message already contains a completion fence ──
-      // This handles the case where the server-side detection also missed (e.g. crash/restart)
-      // and the frontend is about to re-trigger onboarding unnecessarily.
-      if (needsOnboarding && initialMessages.length > 0) {
-        try {
-          const { extractCompletion } = await import('@/lib/onboarding-completion');
-          // Scan assistant messages from newest to oldest for an unprocessed completion
-          for (let i = initialMessages.length - 1; i >= 0; i--) {
-            const msg = initialMessages[i];
-            if (msg.role !== 'assistant') continue;
-            const completion = extractCompletion(msg.content);
-            if (completion?.type === 'onboarding') {
-              console.log('[useAssistantTrigger] Found unprocessed onboarding completion in message history, compensating...');
-              const resp = await fetch('/api/workspace/onboarding', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ answers: completion.answers, sessionId }),
-              });
-              if (resp.ok) {
-                await fetch('/api/workspace/hook-triggered', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    sessionId: '__clear__',
-                    expectedOwner: state.hookTriggeredSessionId || null,
-                  }),
-                }).catch(() => {});
-                console.log('[useAssistantTrigger] Onboarding compensation succeeded, skipping re-trigger');
-                return; // Don't re-trigger onboarding
-              }
-              break; // Found fence but processing failed — fall through to re-trigger
-            }
-          }
-        } catch (e) {
-          console.error('[useAssistantTrigger] Onboarding compensation check failed:', e);
-        }
-      }
-
-      // For daily check-in, only trigger in the most recent session for this workspace.
-      // This prevents older sessions from hijacking the check-in when reopened.
-      if (needsCheckIn) {
-        const latestRes = await fetch(`/api/workspace/latest-session?workingDirectory=${encodeURIComponent(data.path)}`);
-        if (latestRes.ok) {
-          const { sessionId: latestSessionId } = await latestRes.json();
-          if (latestSessionId && latestSessionId !== sessionId) return;
-        }
-      }
+      // Codex P1 — heartbeat is no longer triggered from the foreground.
+      // Earlier rev: chat mount checked `data.needsHeartbeat` and called
+      // startStream({content: '心跳检查', autoTrigger: true}) which ran a
+      // FULL streamClaude turn through /api/chat with every tool the
+      // chat had access to (codepilot_list_tasks, Search, memory_recent,
+      // shell). Since headless / chat had no idle/tool/total timeout
+      // back then, a tool-loop in the heartbeat could leave the
+      // assistant session "running" indefinitely. Worse, it fired
+      // every time a chat mounted, not on a real interval.
+      //
+      // The fix is hard: we don't trigger heartbeat from any UI surface
+      // anymore. Heartbeat is owned exclusively by the background
+      // scheduler (`source='assistant_heartbeat'` task in
+      // scheduled_tasks, fired by `executeDueTask` when next_run + the
+      // stale-check guard both pass). Page mounts only READ state.
+      //
+      // Buddy welcome stays — it's a one-shot adoption flow, not a
+      // recurring background check, and its prompt is plain text with
+      // no tools.
+      const needsBuddyWelcome = state.onboardingComplete && !state.buddy && initialMessages.length === 0;
+      if (!needsBuddyWelcome) return;
 
       // Mark fired so we don't re-trigger on focus/re-render
       assistantTriggerFiredRef.current = true;
@@ -259,16 +253,19 @@ export function useAssistantTrigger({
         return;
       }
 
-      // Use autoTrigger: the message is invisible (no user bubble, no title update)
-      const triggerMsg = needsOnboarding
-        ? '请开始助理引导设置。'
-        : '请开始每日问询。';
+      // Use autoTrigger: the message is invisible (no user bubble, no title update).
+      // Only buddy welcome reaches this point; heartbeat is scheduler-only.
+      const triggerMsg = '请做自我介绍并引导用户领养伙伴。';
       startStream({
         sessionId,
         content: triggerMsg,
         mode,
-        model: currentModel,
-        providerId: currentProviderId,
+        // Use the runtime-filtered resolved pair, not the raw saved
+        // currentModel/currentProviderId — same contract as ChatView's
+        // user-typed send path.
+        model: resolvedModel,
+        providerId: resolvedProviderId,
+        workingDirectory,
         autoTrigger: true,
         thinking: buildThinkingConfig(),
         onModeChanged: (sdkMode) => {
@@ -286,7 +283,7 @@ export function useAssistantTrigger({
     } catch (e) {
       console.error('[useAssistantTrigger] Assistant auto-trigger failed:', e);
     }
-  }, [sessionId, workingDirectory, isStreaming, mode, currentModel, currentProviderId, handleModeChange, buildThinkingConfig, initialMessages, sendMessageRef, initMetaRef]);
+  }, [sessionId, workingDirectory, isStreaming, mode, resolvedModel, resolvedProviderId, noCompatibleProvider, fetchState, handleModeChange, buildThinkingConfig, initialMessages, sendMessageRef, initMetaRef]);
 
   // Fire with a small delay to let the session fully initialize
   useEffect(() => {

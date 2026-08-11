@@ -30,6 +30,8 @@ import {
   validateMode,
 } from './security/validators';
 import { ChannelPluginAdapter } from '../channels/channel-plugin-adapter';
+import type { FeishuChannelPlugin } from '../channels/feishu';
+import path from 'node:path';
 
 /**
  * Extract the real platform chat_id from a potentially synthetic thread-session address.
@@ -344,6 +346,19 @@ export async function stop(): Promise<void> {
 
   state.running = false;
 
+  // Abort all active tool/stream tasks so in-flight Claude sessions stop
+  // writing to DB and release session locks cleanly. Without this, `/stop`
+  // had "interrupt current task" semantics per-session but global stop()
+  // would let running tasks finish in the background uncounted.
+  for (const [sessionId, taskAbort] of state.activeTasks) {
+    try {
+      taskAbort.abort();
+    } catch (err) {
+      console.warn(`[bridge-manager] Error aborting task ${sessionId}:`, err);
+    }
+  }
+  state.activeTasks.clear();
+
   // Abort all event loops
   for (const [, abort] of state.loopAborts) {
     abort.abort();
@@ -363,7 +378,6 @@ export async function stop(): Promise<void> {
   state.adapters.clear();
   state.adapterMeta.clear();
   state.sessionLocks.clear();
-  state.activeTasks.clear();
   state.startedAt = null;
 
   // Re-enable notification bot polling
@@ -531,7 +545,21 @@ async function handleMessage(
           parseMode: 'HTML',
           replyToMessageId: msg.messageId,
         });
+      } else {
+        await deliver(adapter, {
+          address: msg.address,
+          text: 'Working directory is unavailable or is not an absolute directory.',
+          replyToMessageId: msg.messageId,
+        });
       }
+      ack();
+      return;
+    }
+
+    // AskUserQuestion option button (#282)
+    if (msg.callbackData.startsWith('ask:')) {
+      broker.handleAskUserQuestionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
+      // No confirmation — the model will respond to the chosen answer naturally.
       ack();
       return;
     }
@@ -694,11 +722,18 @@ async function handleMessage(
   }
 
   // Build onToolEvent callback for card tool progress
-  let onToolEvent: ((event: any) => void) | undefined;
+  interface ToolEvent {
+    type: string;
+    id?: string;
+    name?: string;
+    tool_use_id?: string;
+    is_error?: boolean;
+  }
+  let onToolEvent: ((event: ToolEvent) => void) | undefined;
   if (cardController) {
-    onToolEvent = (event: any) => {
+    onToolEvent = (event: ToolEvent) => {
       if (event.type === 'tool_use') {
-        cardToolCalls.push({ id: event.id, name: event.name, status: 'running' });
+        cardToolCalls.push({ id: event.id!, name: event.name!, status: 'running' });
       } else if (event.type === 'tool_result') {
         const tc = cardToolCalls.find((t) => t.id === event.tool_use_id);
         if (tc) tc.status = event.is_error ? 'error' : 'complete';
@@ -732,8 +767,22 @@ async function handleMessage(
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
-    // Use text or empty string for image-only messages (prompt is still required by streamClaude)
-    const promptText = text || (hasAttachments ? 'Describe this image.' : '');
+    // Type-aware fallback prompt for attachment-only turns — "Describe this image"
+    // was misleading when audio/video/file types were added (#291).
+    let promptText = text;
+    if (!promptText && hasAttachments) {
+      const types = new Set((msg.attachments || []).map((a) => (a.type || '').split('/')[0]));
+      if (types.has('image') && types.size === 1) {
+        promptText = 'Describe this image.';
+      } else if (types.has('audio') && types.size === 1) {
+        promptText = 'Transcribe and summarize this audio.';
+      } else if (types.has('video') && types.size === 1) {
+        promptText = 'Describe what happens in this video.';
+      } else {
+        // Mixed or file: let the model decide based on attachment content.
+        promptText = 'Please review the attached file(s).';
+      }
+    }
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
       await broker.forwardPermissionRequest(
@@ -791,6 +840,32 @@ async function handleMessage(
           updateChannelBinding(binding.id, { sdkSessionId: result.sdkSessionId });
         }
       } catch { /* best effort */ }
+    }
+  } catch (err) {
+    // processMessage() threw an exception (e.g. provider mismatch, missing
+    // credentials, unexpected runtime error). Deliver error to user instead
+    // of silently swallowing it.
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[bridge-manager] handleMessage threw:`, err);
+    try {
+      if (cardController && cardMessageId) {
+        await cardController.finalize(cardMessageId, `❌ Error: ${escapeHtml(errMsg)}`, 'error');
+        cardFinalized = true;
+      } else {
+        const errorResponse: OutboundMessage = {
+          address: msg.address,
+          text: `<b>Error:</b> ${escapeHtml(errMsg)}`,
+          parseMode: 'HTML',
+          replyToMessageId: msg.messageId,
+        };
+        await deliver(adapter, errorResponse);
+      }
+    } catch (deliverErr) {
+      console.error(`[bridge-manager] Failed to deliver error to user:`, deliverErr);
+    }
+    // Clear SDK session ID on crash to prevent stale resume
+    if (binding.id) {
+      try { updateChannelBinding(binding.id, { sdkSessionId: '' }); } catch { /* best effort */ }
     }
   } finally {
     // Clean up preview state
@@ -870,7 +945,7 @@ async function handleCommand(
       if (args) {
         const validated = validateWorkingDirectory(args);
         if (!validated) {
-          response = 'Invalid path. Must be an absolute path without traversal sequences.';
+          response = 'Invalid path. Must be an existing absolute directory without traversal sequences.';
           break;
         }
         workDir = validated;
@@ -909,7 +984,7 @@ async function handleCommand(
         // Direct path specified
         const validatedPath = validateWorkingDirectory(args);
         if (!validatedPath) {
-          response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
+          response = 'Invalid path. Must be an existing absolute directory without traversal sequences.';
           break;
         }
         const binding = router.resolve(msg.address);
@@ -924,7 +999,7 @@ async function handleCommand(
       // directories across this channel type (not isolated per chat).
       // If multi-user / chat-level isolation is needed in the future,
       // this should be scoped by userId or chatId instead.
-      const bindings = router.listBindings(msg.address.channelType as any);
+      const bindings = router.listBindings(msg.address.channelType);
       const uniqueDirs = [...new Set(
         bindings
           .filter((b) => b.active)
@@ -943,7 +1018,8 @@ async function handleCommand(
 
       // Build inline buttons for project selection
       const inlineButtons = uniqueDirs.map((dir) => {
-        const label = dir === currentCwd ? `📍 ${dir.split('/').pop() || dir}` : (dir.split('/').pop() || dir);
+        const basename = path.basename(dir) || dir;
+        const label = dir === currentCwd ? `📍 ${basename}` : basename;
         return [{
           text: label,
           callbackData: `cwd:${dir}`,
@@ -1041,14 +1117,14 @@ async function handleCommand(
         break;
       }
       const plugin = adapter.getPlugin();
-      if (!plugin.getCardStreamController && !(plugin as any).meta?.channelType) {
+      if (!plugin.getCardStreamController && !plugin.meta?.channelType) {
         response = 'History is not available.';
         break;
       }
       // Use message-actions if the plugin has Feishu-type capabilities
       try {
         const { readMessages, readThreadMessages } = await import('../channels/feishu/message-actions');
-        const restClient = (plugin as any).gateway?.getRestClient?.();
+        const restClient = (plugin as FeishuChannelPlugin)._gateway?.getRestClient?.();
         if (!restClient) {
           response = 'Channel not connected.';
           break;
@@ -1106,7 +1182,7 @@ async function handleCommand(
       try {
         const { searchMessages } = await import('../channels/feishu/message-actions');
         const plugin = adapter.getPlugin();
-        const restClient = (plugin as any).gateway?.getRestClient?.();
+        const restClient = (plugin as FeishuChannelPlugin)._gateway?.getRestClient?.();
         if (!restClient) {
           response = 'Channel not connected.';
           break;
@@ -1148,7 +1224,7 @@ async function handleCommand(
             break;
           }
           const plugin = adapter.getPlugin();
-          const config = (plugin as any).getConfig?.();
+          const config = (plugin as FeishuChannelPlugin).getConfig?.();
           if (!config) {
             response = '❌ Feishu plugin not configured.\n\nPlease set App ID and App Secret in CodePilot settings, or use /feishu auth.';
             break;
@@ -1178,7 +1254,7 @@ async function handleCommand(
             break;
           }
           const plugin = adapter.getPlugin();
-          const config = (plugin as any).getConfig?.();
+          const config = (plugin as FeishuChannelPlugin).getConfig?.();
           if (!config) {
             response = '❌ App credentials not configured.\n\nPlease configure App ID and App Secret in CodePilot Settings → Bridge → Feishu.';
             break;
@@ -1206,7 +1282,7 @@ async function handleCommand(
             break;
           }
           const plugin = adapter.getPlugin();
-          const config = (plugin as any).getConfig?.();
+          const config = (plugin as FeishuChannelPlugin).getConfig?.();
           const lines = ['🔍 Feishu Doctor', ''];
 
           // Config check

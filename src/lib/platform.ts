@@ -9,12 +9,53 @@ const execFileAsync = promisify(execFile);
 export const isWindows = process.platform === 'win32';
 export const isMac = process.platform === 'darwin';
 
+export interface RuntimeArchitectureInfo {
+  platform: NodeJS.Platform;
+  processArch: string;
+  hostArch: string;
+  runningUnderRosetta: boolean;
+}
+
 /**
  * Whether the given binary path requires shell execution.
  * On Windows, .cmd/.bat files cannot be executed directly by execFileSync.
  */
 function needsShell(binPath: string): boolean {
   return isWindows && /\.(cmd|bat)$/i.test(binPath);
+}
+
+function readSysctlValue(name: string): string | null {
+  try {
+    return execFileSync('/usr/sbin/sysctl', ['-in', name], {
+      encoding: 'utf-8',
+      timeout: 1000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+export function getRuntimeArchitectureInfo(): RuntimeArchitectureInfo {
+  const processArch = process.arch;
+  let hostArch = processArch;
+  let runningUnderRosetta = false;
+
+  if (isMac) {
+    const armCapable = readSysctlValue('hw.optional.arm64');
+    if (armCapable === '1') {
+      hostArch = 'arm64';
+    }
+
+    runningUnderRosetta = readSysctlValue('sysctl.proc_translated') === '1';
+  }
+
+  return {
+    platform: process.platform,
+    processArch,
+    hostArch,
+    runningUnderRosetta,
+  };
 }
 
 /**
@@ -51,7 +92,7 @@ export function getExtraPathDirs(): string[] {
 /**
  * Classify a Claude CLI binary path by installation method.
  */
-export type ClaudeInstallType = 'native' | 'homebrew' | 'npm' | 'bun' | 'unknown';
+export type ClaudeInstallType = 'native' | 'homebrew' | 'npm' | 'bun' | 'winget' | 'unknown';
 
 export function classifyClaudePath(binPath: string): ClaudeInstallType {
   const home = os.homedir();
@@ -68,7 +109,7 @@ export function classifyClaudePath(binPath: string): ClaudeInstallType {
   if (normalized === '/usr/local/bin/claude') {
     // /usr/local/bin could be npm or homebrew — check symlink target
     try {
-      const real = fs.realpathSync(binPath);
+      const real = fs.realpathSync.native(binPath);
       if (real.includes('node_modules')) return 'npm';
       if (real.includes('homebrew') || real.includes('Cellar')) return 'homebrew';
       if (real.includes('.bun')) return 'bun';
@@ -140,7 +181,7 @@ export function findAllClaudeBinaries(): ClaudeInstallInfo[] {
   function tryAdd(p: string) {
     try {
       let realPath: string;
-      try { realPath = fs.realpathSync(p); } catch { realPath = p; }
+      try { realPath = fs.realpathSync.native(p); } catch { realPath = p; }
       if (seenReal.has(realPath)) return;
 
       // On Windows, installers create multiple variants in the same directory:
@@ -250,17 +291,45 @@ export function findClaudeBinary(): string | undefined {
 }
 
 function _findClaudeBinaryUncached(): string | undefined {
-  // Try known candidate paths first
-  for (const p of getClaudeCandidatePaths()) {
+  // Two-pass strategy:
+  // Pass 1: file existence (cheap, won't timeout). If found, validate with --version.
+  // Pass 2 (fallback): if --version times out (slow VPN / WSL2), still return the path
+  //   so the SDK can try to spawn it — the user likely has a working binary, just slow.
+  //
+  // Bumped the timeout from 3s → 5s in 2026-04-15: the 3s threshold was tight
+  // for users on slow filesystems (WSL2, network-mounted homes) and contributed
+  // to "Claude Code native binary not found" Sentry events even though the
+  // binary was actually present.
+  const TIMEOUT_MS = 5000;
+  const candidates = getClaudeCandidatePaths();
+
+  // Pass 1: cheap fs.existsSync to find candidates that actually exist on disk
+  const existing: string[] = [];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) existing.push(p);
+    } catch { /* permission denied — skip */ }
+  }
+
+  // Validate each existing candidate. Return the first that responds to --version.
+  // If a candidate exists but --version times out, remember it as a fallback.
+  let timedOutFallback: string | undefined;
+  for (const p of existing) {
     try {
       execFileSync(p, ['--version'], {
-        timeout: 3000,
+        timeout: TIMEOUT_MS,
         stdio: 'pipe',
         shell: needsShell(p),
       });
       return p;
-    } catch {
-      // not found, try next
+    } catch (err) {
+      // Distinguish "file doesn't behave like a CLI" from "validation timed out".
+      // Spawn timeout in execFileSync surfaces as ETIMEDOUT or err.signal === 'SIGTERM'.
+      const e = err as { code?: string; signal?: string };
+      if ((e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM') && !timedOutFallback) {
+        timedOutFallback = p;
+      }
+      // Otherwise keep trying other candidates.
     }
   }
 
@@ -269,7 +338,7 @@ function _findClaudeBinaryUncached(): string | undefined {
     const cmd = isWindows ? 'where' : '/usr/bin/which';
     const args = isWindows ? ['claude'] : ['claude'];
     const result = execFileSync(cmd, args, {
-      timeout: 3000,
+      timeout: TIMEOUT_MS,
       stdio: 'pipe',
       env: { ...process.env, PATH: getExpandedPath() },
       shell: isWindows,
@@ -281,7 +350,7 @@ function _findClaudeBinaryUncached(): string | undefined {
       if (!candidate) continue;
       try {
         execFileSync(candidate, ['--version'], {
-          timeout: 3000,
+          timeout: TIMEOUT_MS,
           stdio: 'pipe',
           shell: needsShell(candidate),
         });
@@ -294,7 +363,11 @@ function _findClaudeBinaryUncached(): string | undefined {
     // not found
   }
 
-  return undefined;
+  // Last resort: a candidate exists on disk but timed out validating. Return
+  // it anyway — the SDK gets a real path to try, instead of silently falling
+  // back to its own hardcoded default which generates the most-useless
+  // "Claude Code native binary not found at <some path>" Sentry error.
+  return timedOutFallback;
 }
 
 /**
@@ -312,6 +385,135 @@ export async function getClaudeVersion(claudePath: string): Promise<string | nul
   } catch {
     return null;
   }
+}
+
+/**
+ * Detect if Claude Code was installed via WinGet on Windows.
+ * WinGet installs to the same path as native (~/.local/bin/), so path-based
+ * classification can't distinguish them. This checks WinGet's package list.
+ * Result is cached for the process lifetime.
+ */
+let _wingetDetectionResult: boolean | null = null;
+
+export async function isWingetInstall(): Promise<boolean> {
+  if (!isWindows) return false;
+  if (_wingetDetectionResult !== null) return _wingetDetectionResult;
+  try {
+    const { stdout } = await execFileAsync('winget', ['list', 'Anthropic.ClaudeCode', '--accept-source-agreements'], {
+      timeout: 5000,
+      shell: true,
+      env: { ...process.env, PATH: getExpandedPath() },
+    });
+    _wingetDetectionResult = stdout.includes('Anthropic.ClaudeCode');
+  } catch {
+    _wingetDetectionResult = false;
+  }
+  return _wingetDetectionResult;
+}
+
+/** Invalidate winget detection cache (e.g. after upgrade) */
+export function invalidateWingetCache(): void {
+  _wingetDetectionResult = null;
+}
+
+/**
+ * Get the upgrade command for a given install type.
+ */
+export interface UpgradeCommand {
+  command: string;
+  args: string[];
+  shell: boolean;
+}
+
+export function getUpgradeCommand(installType: ClaudeInstallType): UpgradeCommand {
+  switch (installType) {
+    case 'homebrew':
+      return { command: 'brew', args: ['upgrade', 'claude-code'], shell: false };
+    case 'npm':
+      // On Windows, npm is a .cmd file that requires shell execution
+      return { command: 'npm', args: ['update', '-g', '@anthropic-ai/claude-code'], shell: isWindows };
+    case 'bun':
+      return { command: 'bun', args: ['update', '-g', '@anthropic-ai/claude-code'], shell: false };
+    case 'winget':
+      return { command: 'winget', args: ['upgrade', 'Anthropic.ClaudeCode', '--accept-source-agreements'], shell: true };
+    case 'native':
+    case 'unknown':
+    default:
+      // `claude update` is the official manual update command for native installs.
+      // It works cross-platform and is simpler than re-running the install script.
+      return { command: 'claude', args: ['update'], shell: false };
+  }
+}
+
+// ── #28: platform shell dialect ─────────────────────────────────────
+// The Agent (any Runtime) generates / shows shell commands. On Windows the
+// model defaults to bash/POSIX (export, rm -rf, /tmp, mkdir -p) which the
+// user can't run in PowerShell. Inject a shell-dialect hint into the system
+// prompt so commands match the platform shell. Pure + override-able so it's
+// unit-testable without a real Windows host.
+
+export type PlatformShell = 'powershell' | 'bash' | 'zsh';
+
+/**
+ * Whether the user EXPLICITLY opted into the bash dialect on Windows.
+ *
+ * #28 (Codex review 2026-05-29): keying off "is Git Bash installed" is the
+ * wrong signal — Git for Windows is near-universal among devs, but most of
+ * them paste commands into PowerShell, not bash. So we do NOT probe install
+ * paths. The only reliable signal that the user actually runs bash is them
+ * having set `CLAUDE_CODE_GIT_BASH_PATH` (the same var ClaudeCode's SDK uses).
+ * Absent that, Windows defaults to PowerShell. WSL reports platform='linux'
+ * (handled by the linux branch below), so it's not a win32 concern.
+ */
+function windowsBashOptIn(): boolean {
+  return !!process.env.CLAUDE_CODE_GIT_BASH_PATH;
+}
+
+/**
+ * Resolve the shell the Agent should target for generated commands.
+ * - win32: **PowerShell by default**; bash ONLY when the user opted in via
+ *   CLAUDE_CODE_GIT_BASH_PATH (a mere Git-for-Windows install does NOT flip it).
+ * - darwin: zsh (default) unless $SHELL says bash.
+ * - linux/other (incl. WSL): bash.
+ * `opts` overrides are for unit tests (process.platform is read-only).
+ */
+export function getPlatformShell(opts?: {
+  platform?: NodeJS.Platform;
+  bashOptIn?: boolean;
+  shellEnv?: string;
+}): PlatformShell {
+  const platform = opts?.platform ?? process.platform;
+  if (platform === 'win32') {
+    const bash = opts?.bashOptIn ?? windowsBashOptIn();
+    return bash ? 'bash' : 'powershell';
+  }
+  if (platform === 'darwin') {
+    const sh = (opts?.shellEnv ?? process.env.SHELL ?? '').toLowerCase();
+    return sh.includes('bash') ? 'bash' : 'zsh';
+  }
+  return 'bash';
+}
+
+/**
+ * System-prompt hint telling the model which shell dialect to emit.
+ * **Empty string off Windows-PowerShell** — so callers can inject it
+ * unconditionally and it's a no-op on macOS / Linux / Windows-with-explicit-
+ * bash-opt-in (zero hot-path change there). Only Windows defaulting to
+ * PowerShell gets the guidance (the #28 fix surface).
+ */
+export function platformCommandGuidance(opts?: {
+  platform?: NodeJS.Platform;
+  bashOptIn?: boolean;
+  shellEnv?: string;
+}): string {
+  if (getPlatformShell(opts) !== 'powershell') return '';
+  return [
+    '- Shell dialect: this machine is Windows and the target shell is PowerShell.',
+    '  Any command you run OR show the user must be PowerShell / Windows-compatible — NOT bash-only.',
+    '  Avoid: `rm -rf`, `export VAR=...`, `source`, `/tmp`, `mkdir -p`, `&&`-only chaining, `$VAR`.',
+    '  Use instead: `Remove-Item -Recurse -Force`, `$env:VAR = "..."`, `New-Item -ItemType Directory -Force`,',
+    '  `$env:TEMP`, `;` or separate lines, `$env:VAR`. (Omitted only when explicit bash opt-in via CLAUDE_CODE_GIT_BASH_PATH is configured.)',
+  ].join('\n');
 }
 
 /**

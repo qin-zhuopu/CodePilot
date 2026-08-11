@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { ThinkingOrb } from 'thinking-orbs';
 import { useTranslation } from '@/hooks/useTranslation';
 import {
   Message as AIMessage,
@@ -8,14 +9,22 @@ import {
   MessageResponse,
 } from '@/components/ai-elements/message';
 import { ToolActionsGroup } from '@/components/ai-elements/tool-actions-group';
+import { MediaPreview } from './MediaPreview';
+import { SearchSources } from './SearchSources';
 import { Button } from '@/components/ui/button';
 import { Shimmer } from '@/components/ai-elements/shimmer';
 import { ImageGenConfirmation } from './ImageGenConfirmation';
 import { BatchPlanInlinePreview } from './batch-image-gen/BatchPlanInlinePreview';
 import { WidgetRenderer } from './WidgetRenderer';
-import { parseAllShowWidgets, computePartialWidgetKey } from './MessageItem';
+import { parseAllShowWidgets, computePartialWidgetKey, MalformedWidgetNotice } from './MessageItem';
 import { PENDING_KEY, buildReferenceImages } from '@/lib/image-ref-store';
-import type { PlannerOutput } from '@/types';
+import type { PlannerOutput, MediaBlock, ExternalSource } from '@/types';
+import { SubagentCard } from './SubagentCard';
+import {
+  buildSubagentRunView,
+  collapseLogicalSubagentRuns,
+  isSubagentToolCall,
+} from '@/lib/subagent-view';
 
 interface ImageGenRequest {
   prompt: string;
@@ -98,24 +107,90 @@ interface ToolResultInfo {
   tool_use_id: string;
   content: string;
   is_error?: boolean;
+  media?: MediaBlock[];
+  sources?: ExternalSource[];
 }
 
 interface StreamingMessageProps {
   content: string;
   isStreaming: boolean;
   sessionId?: string;
+  startedAt: number;
   toolUses?: ToolUseInfo[];
   toolResults?: ToolResultInfo[];
   streamingToolOutput?: string;
+  thinkingContent?: string;
   statusText?: string;
   onForceStop?: () => void;
 }
 
 /**
- * Thinking phase label that evolves over time to reduce perceived wait.
- * 0-5s: "思考中..." / "Thinking..."
- * 5-15s: "深度思考中..." / "Thinking deeply..."
- * 15s+: "组织回复中..." / "Preparing response..."
+ * Smart content buffering — holds initial text until meaningful, but bypasses
+ * for structured blocks (show-widget, batch-plan, image-gen-request).
+ */
+const BUFFER_WORD_THRESHOLD = 40;
+const BUFFER_MAX_MS = 2500;
+const STRUCTURED_BLOCK_RE = /```(show-widget|batch-plan|image-gen-request)/;
+
+function useBufferedContent(rawContent: string, isStreaming: boolean): string {
+  const [bypassed, setBypassed] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Derive whether bypass conditions are met (pure computation, no side effects)
+  const shouldBypass = !isStreaming
+    || bypassed
+    || (!!rawContent && STRUCTURED_BLOCK_RE.test(rawContent))
+    || (!!rawContent && rawContent.split(/\s+/).filter(Boolean).length >= BUFFER_WORD_THRESHOLD);
+
+  // Effect: sync bypass state when conditions are met (one-way latch, safe)
+  useEffect(() => {
+    if (shouldBypass && !bypassed && isStreaming && rawContent) {
+      setBypassed(true); // eslint-disable-line react-hooks/set-state-in-effect
+    }
+  }, [shouldBypass, bypassed, isStreaming, rawContent]);
+
+  // Effect: reset on new turn (content emptied)
+  useEffect(() => {
+    if (!rawContent && !isStreaming) {
+      setBypassed(false); // eslint-disable-line react-hooks/set-state-in-effect
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    }
+  }, [rawContent, isStreaming]);
+
+  // Effect: max timeout — starts once when content first arrives during streaming.
+  // Uses a boolean gate (hasContent) so the timer is created exactly once, not on every delta.
+  const hasContent = !!rawContent;
+  useEffect(() => {
+    if (!isStreaming || bypassed || !hasContent) return;
+    // Only start the timer if one isn't already running
+    if (timerRef.current) return;
+    timerRef.current = setTimeout(() => {
+      setBypassed(true);
+      timerRef.current = null;
+    }, BUFFER_MAX_MS);
+    // No cleanup — timer must survive rawContent changes.
+    // It is cleaned up by the reset effect (when content empties) or when bypassed is set.
+  }, [isStreaming, bypassed, hasContent]);
+
+  // Pure render: no side effects
+  if (!isStreaming) return rawContent;
+  if (shouldBypass) return rawContent;
+  return '';
+}
+
+/**
+ * Wait-phase label shown while waiting for the first content token.
+ * Pure UX-comfort progression — NOT tied to model thinking/reasoning state.
+ * Real reasoning content is rendered separately by ToolActionsGroup's ThinkingRow.
+ *   0-5s:  "生成中..." / "Generating..."
+ *   5-15s: "回复中..." / "Responding..."
+ *   15s+:  "组织回复中..." / "Preparing response..."
+ * Wording deliberately avoids "thinking" because users read it as the model
+ * actually reasoning hard — misleading for short prompts where the model
+ * just hasn't streamed first byte yet.
  */
 function ThinkingPhaseLabel() {
   const { t } = useTranslation();
@@ -133,20 +208,52 @@ function ThinkingPhaseLabel() {
       ? t('streaming.thinkingDeep')
       : t('streaming.preparing');
 
-  return <Shimmer>{text}</Shimmer>;
+  return (
+    <div className="inline-flex items-center gap-2 text-muted-foreground">
+      <ThinkingOrb
+        state="working"
+        size={20}
+        role="presentation"
+        aria-hidden="true"
+        className="shrink-0 opacity-70"
+      />
+      <Shimmer>{text}</Shimmer>
+    </div>
+  );
 }
 
-function ElapsedTimer() {
-  const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(0);
+function ElapsedTimer({ startedAt }: { startedAt: number }) {
+  // Phase 6 P0 follow-up (2026-05-15) — guard against the brief
+  // window right after `setIsStreaming(true)` where the parent
+  // hasn't yet populated `startedAt` (snapshot can still be 0 /
+  // undefined / NaN). Without this gate the JS arithmetic
+  // produces `NaN` (undefined minus number) or a huge nonsense
+  // number (0 minus Date.now()), and the rendered `${secs}s`
+  // template flashes "NaNs" or "1.7e9s" for a tick. The status
+  // bar's "Thinking..." shimmer + label still surface — we just
+  // hide the elapsed-time counter until the start timestamp is
+  // a real positive monotonic value.
+  const startedAtIsReady = Number.isFinite(startedAt) && startedAt > 0;
+  const [elapsed, setElapsed] = useState(() =>
+    startedAtIsReady ? Math.floor((Date.now() - startedAt) / 1000) : 0,
+  );
 
+  // The parent keys this component by `startedAt` (see render site), so a new
+  // turn / session switch remounts it and the lazy initializer above repaints
+  // the correct first value synchronously — no stale tick. This effect then
+  // only ticks every second; setState runs in the interval callback (async),
+  // never in the effect body, so there's no set-state-in-effect cascade.
+  // (#35 on-touch — previously a same-render reset effect that the React
+  // Compiler flagged; key-based remount is the clean equivalent.)
   useEffect(() => {
-    startRef.current = Date.now();
+    if (!startedAtIsReady) return;
     const interval = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
+      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
     }, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [startedAt, startedAtIsReady]);
+
+  if (!startedAtIsReady) return null;
 
   const mins = Math.floor(elapsed / 60);
   const secs = elapsed % 60;
@@ -158,7 +265,7 @@ function ElapsedTimer() {
   );
 }
 
-function StreamingStatusBar({ statusText, onForceStop }: { statusText?: string; onForceStop?: () => void }) {
+function StreamingStatusBar({ statusText, onForceStop, startedAt }: { statusText?: string; onForceStop?: () => void; startedAt: number }) {
   const displayText = statusText || 'Thinking';
 
   // Parse elapsed seconds from statusText like "Running bash... (45s)"
@@ -181,7 +288,7 @@ function StreamingStatusBar({ statusText, onForceStop }: { statusText?: string; 
         )}
       </div>
       <span className="text-muted-foreground/50">|</span>
-      <ElapsedTimer />
+      <ElapsedTimer key={startedAt} startedAt={startedAt} />
       {isCritical && onForceStop && (
         <Button
           variant="outline"
@@ -200,15 +307,53 @@ export function StreamingMessage({
   content,
   isStreaming,
   sessionId,
+  startedAt,
   toolUses = [],
   toolResults = [],
   streamingToolOutput,
+  thinkingContent,
   statusText,
   onForceStop,
 }: StreamingMessageProps) {
   const { t } = useTranslation();
-  const runningTools = toolUses.filter(
-    (tool) => !toolResults.some((r) => r.tool_use_id === tool.id)
+  const bufferedContent = useBufferedContent(content, isStreaming);
+  // A2 (audit 2026-06): index toolResults by id once, then reuse for both the
+  // running-tools filter and the per-tool lookup in the render below. Both
+  // previously did an O(n) scan inside an O(n) loop → O(n²) every render.
+  const toolResultsById = useMemo(
+    () => new Map(toolResults.map((r) => [r.tool_use_id, r] as const)),
+    [toolResults]
+  );
+  const runningTools = useMemo(
+    () => toolUses.filter((tool) => !toolResultsById.has(tool.id)),
+    [toolUses, toolResultsById]
+  );
+  const subagentTools = useMemo(
+    () => toolUses.filter((tool) => {
+      const result = toolResultsById.get(tool.id);
+      return isSubagentToolCall(tool.name, tool.input, result?.content);
+    }),
+    [toolUses, toolResultsById],
+  );
+  const subagentRuns = useMemo(
+    () => collapseLogicalSubagentRuns(subagentTools.map((tool) => {
+      const result = toolResultsById.get(tool.id);
+      return buildSubagentRunView({
+        id: tool.id,
+        name: tool.name,
+        toolInput: tool.input,
+        result: result?.content,
+        isError: result?.is_error,
+      });
+    })),
+    [subagentTools, toolResultsById],
+  );
+  const regularTools = useMemo(
+    () => toolUses.filter((tool) => {
+      const result = toolResultsById.get(tool.id);
+      return !isSubagentToolCall(tool.name, tool.input, result?.content);
+    }),
+    [toolUses, toolResultsById],
   );
 
   // Extract a human-readable summary of the running command
@@ -232,49 +377,78 @@ export function StreamingMessage({
   return (
     <AIMessage from="assistant">
       <MessageContent>
-        {/* Tool calls — compact collapsible group */}
-        {toolUses.length > 0 && (
+        {/* Tool calls + thinking — single collapsible group */}
+        {(regularTools.length > 0 || thinkingContent) && (
           <ToolActionsGroup
-            tools={toolUses.map((tool) => {
-              const result = toolResults.find((r) => r.tool_use_id === tool.id);
+            tools={regularTools.map((tool) => {
+              const result = toolResultsById.get(tool.id);
               return {
                 id: tool.id,
                 name: tool.name,
                 input: tool.input,
                 result: result?.content,
                 isError: result?.is_error,
+                media: result?.media,
               };
             })}
             isStreaming={isStreaming}
             streamingToolOutput={streamingToolOutput}
+            thinkingContent={thinkingContent}
           />
         )}
+
+        {/* Media from tool results — rendered outside tool group so images stay visible */}
+        {(() => {
+          const allMedia = toolResults.flatMap(r => r.media || []);
+          return allMedia.length > 0 ? <MediaPreview media={allMedia} /> : null;
+        })()}
+
+        <SearchSources sources={toolResults.flatMap(result => result.sources || [])} />
 
         {/* Streaming text content rendered via Streamdown */}
         {content && (() => {
           // ── Show-widget handling ──
           // During streaming: detect partial fences FIRST to avoid premature script execution.
           // After streaming: use parseAllShowWidgets for completed fences only.
-          const hasWidgetFence = /```show-widget/.test(content);
+          const hasWidgetFence = /`{1,3}show-widget/.test(content);
 
           if (hasWidgetFence && isStreaming) {
-            // Streaming mode: find the last ```show-widget fence.
-            // If it's closed, all fences are complete → render them all.
-            // If it's open, render completed fences before it + partial preview for the open one.
-            const lastFenceStart = content.lastIndexOf('```show-widget');
+            // Fence-agnostic: find the last show-widget marker
+            const lastMarkerMatch = [...content.matchAll(/`{1,3}show-widget/g)].pop();
+            if (!lastMarkerMatch) return <MessageResponse>{content}</MessageResponse>;
+
+            const lastFenceStart = lastMarkerMatch.index!;
             const afterLastFence = content.slice(lastFenceStart);
-            const lastFenceClosed = /```show-widget\s*\n?[\s\S]*?\n?\s*```/.test(afterLastFence);
+            // Check if JSON is complete (has matching closing brace)
+            const jsonStart = afterLastFence.indexOf('{');
+            let lastFenceClosed = false;
+            if (jsonStart !== -1) {
+              let depth = 0, inStr = false, esc = false;
+              for (let i = jsonStart; i < afterLastFence.length; i++) {
+                const ch = afterLastFence[i];
+                if (esc) { esc = false; continue; }
+                if (ch === '\\' && inStr) { esc = true; continue; }
+                if (ch === '"') { inStr = !inStr; continue; }
+                if (inStr) continue;
+                if (ch === '{') depth++;
+                else if (ch === '}') { depth--; if (depth === 0) { lastFenceClosed = true; break; } }
+              }
+            }
 
             if (lastFenceClosed) {
               // All fences complete — parse and render the full content
               const allSegments = parseAllShowWidgets(content);
               return (
                 <>
-                  {allSegments.map((seg, i) =>
-                    seg.type === 'text'
-                      ? <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>
-                      : <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />
-                  )}
+                  {allSegments.map((seg, i) => {
+                    if (seg.type === 'text') {
+                      return <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>;
+                    }
+                    if (seg.type === 'malformed_widget') {
+                      return <MalformedWidgetNotice key={`mw-${i}`} reason={seg.reason} raw={seg.raw} />;
+                    }
+                    return <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />;
+                  })}
                 </>
               );
             }
@@ -282,11 +456,12 @@ export function StreamingMessage({
             // Last fence is still being streamed.
             // Parse everything BEFORE it (completed fences + interleaved text).
             const beforePart = content.slice(0, lastFenceStart).trim();
-            const hasCompletedFences = beforePart && /```show-widget/.test(beforePart);
+            const hasCompletedFences = beforePart && /`{1,3}show-widget/.test(beforePart);
             const completedSegments = hasCompletedFences ? parseAllShowWidgets(beforePart) : [];
 
-            // Extract partial widget_code from the open fence
-            const fenceBody = content.slice(lastFenceStart + '```show-widget'.length).trim();
+            // Extract partial widget_code from the open fence (skip marker)
+            const markerEnd = afterLastFence.match(/^`{1,3}show-widget`{0,3}\s*(?:\n\s*`{3}(?:json)?\s*)?\n?/);
+            const fenceBody = markerEnd ? afterLastFence.slice(markerEnd[0].length).trim() : afterLastFence.trim();
             let partialCode: string | null = null;
             const keyIdx = fenceBody.indexOf('"widget_code"');
             if (keyIdx !== -1) {
@@ -304,6 +479,7 @@ export function StreamingMessage({
                       .replace(/\\t/g, '\t')
                       .replace(/\\r/g, '\r')
                       .replace(/\\"/g, '"')
+                      .replace(/\\u([0-9a-fA-F]{4})/g, (_: string, hex: string) => String.fromCharCode(parseInt(hex, 16)))
                       .replace(/\x00BACKSLASH\x00/g, '\\');
                   } catch { partialCode = null; }
                 }
@@ -341,11 +517,15 @@ export function StreamingMessage({
                   <MessageResponse key="pre-text">{beforePart}</MessageResponse>
                 )}
                 {/* Completed widget fences + interleaved text */}
-                {completedSegments.map((seg, i) =>
-                  seg.type === 'text'
-                    ? <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>
-                    : <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />
-                )}
+                {completedSegments.map((seg, i) => {
+                  if (seg.type === 'text') {
+                    return <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>;
+                  }
+                  if (seg.type === 'malformed_widget') {
+                    return <MalformedWidgetNotice key={`mw-${i}`} reason={seg.reason} raw={seg.raw} />;
+                  }
+                  return <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />;
+                })}
                 {partialCode && partialCode.length > 10 ? (
                   <WidgetRenderer key={partialWidgetKey} widgetCode={partialCode} isStreaming={true} title={partialTitle} showOverlay={scriptsTruncated} />
                 ) : (
@@ -361,11 +541,15 @@ export function StreamingMessage({
             if (widgetSegments.length > 0) {
               return (
                 <>
-                  {widgetSegments.map((seg, i) =>
-                    seg.type === 'text'
-                      ? <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>
-                      : <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />
-                  )}
+                  {widgetSegments.map((seg, i) => {
+                    if (seg.type === 'text') {
+                      return <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>;
+                    }
+                    if (seg.type === 'malformed_widget') {
+                      return <MalformedWidgetNotice key={`mw-${i}`} reason={seg.reason} raw={seg.raw} />;
+                    }
+                    return <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />;
+                  })}
                 </>
               );
             }
@@ -411,7 +595,9 @@ export function StreamingMessage({
           if (isStreaming) {
             const hasImageGenBlock = /```image-gen-request/.test(content);
             const hasBatchPlanBlock = /```batch-plan/.test(content);
-            const stripped = content
+            // Use bufferedContent for plain text to avoid initial character flicker
+            const textToRender = bufferedContent || '';
+            const stripped = textToRender
               .replace(/```image-gen-request[\s\S]*$/, '')
               .replace(/```batch-plan[\s\S]*$/, '')
               .replace(/```show-widget[\s\S]*$/, '')
@@ -429,8 +615,8 @@ export function StreamingMessage({
           return stripped ? <MessageResponse>{stripped}</MessageResponse> : null;
         })()}
 
-        {/* Loading indicator when no content yet — evolves over time */}
-        {isStreaming && !content && toolUses.length === 0 && (
+        {/* Loading indicator when no content yet and no thinking content — evolves over time */}
+        {isStreaming && !content && toolUses.length === 0 && !thinkingContent && (
           <div className="py-2">
             <ThinkingPhaseLabel />
           </div>
@@ -453,7 +639,21 @@ export function StreamingMessage({
             return t('widget.streaming');
           })() : undefined)
           || (content && content.length > 0 ? t('streaming.generating') : undefined)
-        } onForceStop={onForceStop} />}
+        } onForceStop={onForceStop} startedAt={startedAt} />}
+
+        {/* Compact Sub Agent capsules follow the parent's live output and wrap
+            into the available row width. */}
+        {subagentRuns.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {subagentRuns.map(run => (
+              <SubagentCard
+                key={run.id}
+                run={run}
+                sessionId={sessionId}
+              />
+            ))}
+          </div>
+        )}
       </MessageContent>
     </AIMessage>
   );

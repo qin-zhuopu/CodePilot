@@ -5,7 +5,8 @@ import type { ComponentProps, HTMLAttributes } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import Ansi from "ansi-to-react";
-import { Check, Copy, Terminal as TerminalIcon, Trash } from "@phosphor-icons/react";
+import { Check } from "@phosphor-icons/react";
+import { CodePilotIcon } from "@/components/ui/semantic-icon";
 import {
   createContext,
   useCallback,
@@ -56,7 +57,7 @@ export const Terminal = ({
     <TerminalContext.Provider value={contextValue}>
       <div
         className={cn(
-          "flex flex-col overflow-hidden rounded-lg border bg-zinc-950 text-zinc-100",
+          "flex flex-col overflow-hidden rounded-lg border bg-[var(--terminal-bg)] text-[var(--terminal-foreground)]",
           className
         )}
         {...props}
@@ -90,7 +91,7 @@ export const TerminalHeader = ({
 }: TerminalHeaderProps) => (
   <div
     className={cn(
-      "flex items-center justify-between border-zinc-800 border-b px-4 py-2",
+      "flex items-center justify-between border-[var(--terminal-border)] border-b px-4 py-2",
       className
     )}
     {...props}
@@ -107,10 +108,10 @@ export const TerminalTitle = ({
   ...props
 }: TerminalTitleProps) => (
   <div
-    className={cn("flex items-center gap-2 text-sm text-zinc-400", className)}
+    className={cn("flex items-center gap-2 text-sm text-[var(--terminal-muted)]", className)}
     {...props}
   >
-    <TerminalIcon className="size-4" />
+    <CodePilotIcon name="terminal" size="md" aria-hidden />
     {children ?? "Terminal"}
   </div>
 );
@@ -130,7 +131,7 @@ export const TerminalStatus = ({
 
   return (
     <div
-      className={cn("flex items-center gap-2 text-xs text-zinc-400", className)}
+      className={cn("flex items-center gap-2 text-xs text-[var(--terminal-muted)]", className)}
       {...props}
     >
       {children ?? <Shimmer className="w-16">Loading...</Shimmer>}
@@ -191,12 +192,10 @@ export const TerminalCopyButton = ({
     []
   );
 
-  const Icon = isCopied ? Check : Copy;
-
   return (
     <Button
       className={cn(
-        "size-7 shrink-0 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100",
+        "size-7 shrink-0 text-[var(--terminal-muted)] hover:bg-[var(--terminal-hover-bg)] hover:text-[var(--terminal-foreground)]",
         className
       )}
       onClick={copyToClipboard}
@@ -204,7 +203,7 @@ export const TerminalCopyButton = ({
       variant="ghost"
       {...props}
     >
-      {children ?? <Icon size={14} />}
+      {children ?? (isCopied ? <Check size={14} /> : <CodePilotIcon name="copy" size="sm" aria-hidden />)}
     </Button>
   );
 };
@@ -225,7 +224,7 @@ export const TerminalClearButton = ({
   return (
     <Button
       className={cn(
-        "size-7 shrink-0 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100",
+        "size-7 shrink-0 text-[var(--terminal-muted)] hover:bg-[var(--terminal-hover-bg)] hover:text-[var(--terminal-foreground)]",
         className
       )}
       onClick={onClear}
@@ -233,7 +232,7 @@ export const TerminalClearButton = ({
       variant="ghost"
       {...props}
     >
-      {children ?? <Trash size={14} />}
+      {children ?? <CodePilotIcon name="delete" size="sm" aria-hidden />}
     </Button>
   );
 };
@@ -268,7 +267,7 @@ export const TerminalContent = ({
         <pre className="whitespace-pre-wrap break-words">
           <Ansi>{output}</Ansi>
           {isStreaming && (
-            <span className="ml-0.5 inline-block h-4 w-2 animate-pulse bg-zinc-100" />
+            <span className="ml-0.5 inline-block h-4 w-2 animate-pulse bg-[var(--terminal-foreground)]" />
           )}
         </pre>
       )}

@@ -5,6 +5,7 @@ import { HeroSection } from '@/components/marketing/HeroSection';
 import { FeaturesSection } from '@/components/marketing/FeaturesSection';
 import { IntegrationsSection } from '@/components/marketing/IntegrationsSection';
 import { FAQSection } from '@/components/marketing/FAQAccordion';
+import { ReleasesSection } from '@/components/marketing/ReleasesSection';
 import { FinalCTA } from '@/components/marketing/FinalCTA';
 import { SiteFooter } from '@/components/marketing/SiteFooter';
 import { siteConfig } from '@/lib/site.config';
@@ -18,10 +19,10 @@ export async function generateMetadata({
   const isZh = lang === 'zh';
   return {
     title: isZh
-      ? 'CodePilot — Claude Code 的桌面工作空间'
-      : 'CodePilot — Desktop Workspace for Claude Code',
+      ? 'CodePilot — 多模型 AI Agent 桌面客户端'
+      : 'CodePilot — Multi-Model AI Agent Desktop Client',
     description: isZh
-      ? '将对话、Provider、MCP、Skills 和项目上下文整合到一个桌面界面中。'
+      ? '连接任意 AI 服务商，通过 MCP 和 Skills 扩展能力，手机远程控制，让你的助理学会你的工作方式。'
       : siteConfig.description,
     alternates: {
       canonical: isZh ? `${siteConfig.url}/zh` : siteConfig.url,
@@ -48,6 +49,7 @@ export default async function HomePage({
       <FeaturesSection content={content.features} />
       <IntegrationsSection content={content.openSource} />
       <FAQSection content={content.faq} />
+      <ReleasesSection content={content.releases} />
       <FinalCTA content={content.cta} locale={lang} />
       <SiteFooter content={content.footer} />
     </main>

@@ -59,7 +59,20 @@ const eslintConfig = defineConfig([
     },
   },
 
-  // ── Discourage Lucide imports project-wide ──
+  // ── Phase 7 icon guardrails (revised 2026-05-21) ──
+  // Goal: business code defaults to CodePilotIcon (semantic layer →
+  // HugeIcons via @/components/ui/semantic-icon). @/components/ui/icon
+  // (Phosphor wrapper) stays as a compatibility surface for STRUCTURAL
+  // icons (CaretDown, CheckCircle, X, status badges, Caret*, SpinnerGap,
+  // etc.) and for files in the ai-elements/shadcn primitive allowlist.
+  //
+  // Three specific Phosphor names — Brain / Lightning / Terminal — are
+  // banned at the wrapper level because Phase 7 mapped them to semantic
+  // aliases (memory / runtime / terminal / cli / skill). Importing the
+  // raw names re-introduces the cross-semantic overload Phase 7 resolved.
+  //
+  // Lucide is banned project-wide; redirect target updated from
+  // @phosphor-icons/react (pre-Phase-7) to CodePilotIcon semantic layer.
   {
     files: ["src/**/*.{ts,tsx}"],
     rules: {
@@ -69,7 +82,10 @@ const eslintConfig = defineConfig([
           patterns: [
             {
               group: ["lucide-react"],
-              message: "Use @phosphor-icons/react instead. See docs/ui-governance.md for mapping.",
+              message:
+                "Use CodePilotIcon from @/components/ui/semantic-icon (semantic layer → HugeIcons). " +
+                "For structural icons not yet aliased (CaretDown, status badges), import from @/components/ui/icon. " +
+                "See docs/handover/icon-system.md.",
             },
           ],
         },
@@ -77,7 +93,10 @@ const eslintConfig = defineConfig([
     },
   },
 
-  // ── Discourage direct Phosphor imports outside ui/ and ai-elements/ — use ui/icon.tsx ──
+  // Business code: prefer CodePilotIcon. Direct @phosphor-icons/react
+  // import remains a warning (redirect target updated to the semantic
+  // layer). Named-import block: Brain / Lightning / Terminal from the
+  // wrapper are banned to prevent cross-semantic regression.
   {
     files: [
       "src/components/settings/**/*.{ts,tsx}",
@@ -89,8 +108,10 @@ const eslintConfig = defineConfig([
       "src/components/project/**/*.{ts,tsx}",
       "src/components/layout/**/*.{ts,tsx}",
       "src/components/cli-tools/**/*.{ts,tsx}",
+      "src/components/git/**/*.{ts,tsx}",
       "src/app/**/*.{ts,tsx}",
       "src/hooks/**/*.{ts,tsx}",
+      "src/lib/**/*.{ts,tsx}",
     ],
     rules: {
       "no-restricted-imports": [
@@ -99,7 +120,56 @@ const eslintConfig = defineConfig([
           patterns: [
             {
               group: ["@phosphor-icons/react"],
-              message: "Import icons from @/components/ui/icon instead. See docs/ui-governance.md.",
+              message:
+                "Prefer CodePilotIcon from @/components/ui/semantic-icon (semantic layer → HugeIcons). " +
+                "Structural icons without HugeIcons equivalent (CaretDown, CheckCircle, Warning, etc.) " +
+                "can import from @/components/ui/icon.",
+            },
+          ],
+          paths: [
+            {
+              name: "@/components/ui/icon",
+              importNames: ["Brain", "Lightning", "Terminal"],
+              message:
+                "Phase 7 mapped these to semantic aliases: " +
+                "Brain → CodePilotIcon name=\"memory\"; " +
+                "Lightning → \"runtime\" (or \"skill\" / \"code\" depending on context); " +
+                "Terminal → \"terminal\" (for shell UI) or \"cli\" (for CLI tools catalog). " +
+                "Importing the raw Phosphor name re-introduces the cross-semantic overload Phase 7 resolved.",
+            },
+            {
+              name: "@phosphor-icons/react",
+              importNames: ["Brain", "Lightning", "Terminal"],
+              message:
+                "Phase 7 mapped these to semantic aliases (see CodePilotIcon). " +
+                "Bypassing the wrapper does NOT bypass the ban — raw Phosphor Brain / Lightning / Terminal " +
+                "re-introduces the cross-semantic overload Phase 7 resolved. Use CodePilotIcon name=\"memory|runtime|terminal|cli|skill|code\" instead.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+
+  // File type artwork is a build-time-only dependency. Product code may
+  // consume only the generated static subset through FileTypeIcon.
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: ["src/components/ui/FileTypeIcon.tsx"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["material-icon-theme", "material-icon-theme/*"],
+              message:
+                "material-icon-theme is build-time only; use FileTypeIcon.",
+            },
+            {
+              group: ["@/components/ui/file-type-icons.generated"],
+              message:
+                "Only FileTypeIcon may import the generated icon mapping.",
             },
           ],
         },
@@ -108,7 +178,7 @@ const eslintConfig = defineConfig([
   },
 
   // ── Raw status colors ──
-  // ESLint cannot lint inside className strings. Use `npm run lint:colors` (grep-based)
+  // ESLint cannot lint inside className strings. Use `npm run lint:colors`.
   // to check for raw green/red/yellow/orange/blue-{400-700} usage in business components.
   // Add `// lint-allow-raw-color` on lines where raw colors are intentional (e.g. diff syntax).
 

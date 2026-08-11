@@ -8,18 +8,23 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
+import { CaretRight } from "@phosphor-icons/react";
+import { CodePilotIcon } from "@/components/ui/semantic-icon";
+import { Input } from "@/components/ui/input";
 import {
-  Folder,
-  FolderOpen,
-  File,
-  CaretRight,
-  Plus,
-} from "@phosphor-icons/react";
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   createContext,
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -28,8 +33,23 @@ interface FileTreeContextType {
   togglePath: (path: string) => void;
   selectedPath?: string;
   onSelect?: (path: string) => void;
-  onAdd?: (path: string) => void;
+  /** Context-menu action for adding a file or directory to chat. */
+  onAdd?: (path: string, nodeType: 'file' | 'directory') => void;
+  /** Localised label used by the context-menu action. */
+  addLabel?: string;
+  /**
+   * Separate selected-folder channel from selectedPath so folder and file
+   * selection can coexist without one stomping the other. Folder
+   * selection is what drives the "create in this folder" default target.
+   */
+  selectedFolderPath?: string;
+  onSelectFolder?: (folderPath: string) => void;
 }
+
+// Module-scope immutable empty Set. Inlining `new Set()` as a destructuring
+// default parameter (e.g. `defaultExpanded = new Set()`) triggered a production
+// ReferenceError under Next.js 16 + Turbopack in v0.50.2 (Sentry NEXT-PA).
+const EMPTY_EXPANDED: Set<string> = new Set();
 
 // Default noop for context default value
 // oxlint-disable-next-line eslint(no-empty-function)
@@ -46,16 +66,23 @@ export type FileTreeProps = HTMLAttributes<HTMLDivElement> & {
   defaultExpanded?: Set<string>;
   selectedPath?: string;
   onSelect?: (path: string) => void;
-  onAdd?: (path: string) => void;
+  onAdd?: (path: string, nodeType: 'file' | 'directory') => void;
+  /** Localised label for the add-to-chat context-menu action. */
+  addLabel?: string;
+  selectedFolderPath?: string;
+  onSelectFolder?: (folderPath: string) => void;
   onExpandedChange?: (expanded: Set<string>) => void;
 };
 
 export const FileTree = ({
   expanded: controlledExpanded,
-  defaultExpanded = new Set(),
+  defaultExpanded = EMPTY_EXPANDED,
   selectedPath,
   onSelect,
   onAdd,
+  addLabel,
+  selectedFolderPath,
+  onSelectFolder,
   onExpandedChange,
   className,
   children,
@@ -79,15 +106,19 @@ export const FileTree = ({
   );
 
   const contextValue = useMemo(
-    () => ({ expandedPaths, onAdd, onSelect, selectedPath, togglePath }),
-    [expandedPaths, onAdd, onSelect, selectedPath, togglePath]
+    () => ({ expandedPaths, onAdd, addLabel, onSelect, selectedPath, togglePath, selectedFolderPath, onSelectFolder }),
+    [expandedPaths, onAdd, addLabel, onSelect, selectedPath, togglePath, selectedFolderPath, onSelectFolder]
   );
 
   return (
     <FileTreeContext.Provider value={contextValue}>
       <div
         className={cn(
-          "rounded-lg border bg-background font-mono text-sm",
+          // File names are panel navigation chrome, not code content. Keeping
+          // the whole tree in `font-mono text-sm` makes rows optically larger
+          // than the surrounding compact controls. Reserve monospace for full
+          // paths and editable technical identifiers instead.
+          "rounded-lg border bg-background text-xs font-normal",
           className
         )}
         role="tree"
@@ -114,27 +145,82 @@ const FileTreeFolderContext = createContext<FileTreeFolderContextType>({
 export type FileTreeFolderProps = HTMLAttributes<HTMLDivElement> & {
   path: string;
   name: string;
+  onCreateFile?: () => void;
+  onCreateFolder?: () => void;
+  onRename?: (nextName: string) => Promise<void>;
+  onDelete?: () => void;
+  protectedPath?: boolean;
+  labels?: FileTreeActionLabels;
 };
 
 export const FileTreeFolder = ({
   path,
   name,
+  onCreateFile,
+  onCreateFolder,
+  onRename,
+  onDelete,
+  protectedPath,
+  labels,
   className,
   children,
   ...props
 }: FileTreeFolderProps) => {
-  const { expandedPaths, togglePath } =
+  const { expandedPaths, togglePath, selectedFolderPath, onSelectFolder, onAdd, addLabel } =
     useContext(FileTreeContext);
   const isExpanded = expandedPaths.has(path);
+  const isSelected = selectedFolderPath === path;
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(name);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renamePending, setRenamePending] = useState(false);
+  const contextRenameIntentRef = useRef(false);
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   const handleToggle = useCallback(() => {
     togglePath(path);
-  }, [togglePath, path]);
+    // Clicking a folder row both toggles expand/collapse and marks it
+    // selected — matches VS Code's Explorer behavior. Selection drives
+    // the "create inside this folder" default target in the panel's
+    // new-item flow.
+    onSelectFolder?.(path);
+  }, [togglePath, onSelectFolder, path]);
 
   const folderContextValue = useMemo(
     () => ({ isExpanded, name, path }),
     [isExpanded, name, path]
   );
+
+  const submitRename = useCallback(async () => {
+    const nextName = renameValue.trim();
+    if (!onRename || !nextName || nextName === name) {
+      setRenaming(false);
+      setRenameValue(name);
+      setRenameError(null);
+      return;
+    }
+    setRenamePending(true);
+    setRenameError(null);
+    try {
+      await onRename(nextName);
+      setRenaming(false);
+    } catch (error) {
+      setRenameError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRenamePending(false);
+    }
+  }, [name, onRename, renameValue]);
+
+  const beginRename = useCallback(() => {
+    setRenameValue(name);
+    setRenameError(null);
+    setRenaming(true);
+  }, [name]);
+
+  const beginContextRename = useCallback(() => {
+    contextRenameIntentRef.current = true;
+    beginRename();
+  }, [beginRename]);
 
   return (
     <FileTreeFolderContext.Provider value={folderContextValue}>
@@ -142,15 +228,25 @@ export const FileTreeFolder = ({
         <div
           className={cn("", className)}
           role="treeitem"
+          aria-selected={isSelected}
           {...props}
         >
-          <CollapsibleTrigger asChild>
-            <div
-              className="flex w-full cursor-pointer items-center gap-1 rounded px-2 py-1 text-left transition-colors hover:bg-muted/50"
+          <ContextMenu>
+            <CollapsibleTrigger asChild>
+              <ContextMenuTrigger asChild>
+                <div
+              className={cn(
+                "group/folder flex w-full cursor-pointer items-center gap-1 rounded py-1 pl-1.5 pr-2 text-left transition-colors hover:bg-muted/50",
+                isSelected && "bg-primary/[0.05] text-foreground",
+              )}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
+                if (e.key === "F2" && onRename) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  beginRename();
+                } else if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   handleToggle();
                 }
@@ -165,16 +261,85 @@ export const FileTreeFolder = ({
                   )}
                 />
               </span>
-              <FileTreeIcon>
-                {isExpanded ? (
-                  <FolderOpen size={16} className="text-muted-foreground" />
-                ) : (
-                  <Folder size={16} className="text-muted-foreground" />
-                )}
-              </FileTreeIcon>
-              <FileTreeName>{name}</FileTreeName>
-            </div>
-          </CollapsibleTrigger>
+              {renaming ? (
+                <Input
+                  ref={renameInputRef}
+                  autoFocus
+                  value={renameValue}
+                  disabled={renamePending}
+                  onChange={(event) => setRenameValue(event.target.value)}
+                  onClick={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onContextMenu={(event) => event.stopPropagation()}
+                  onBlur={() => {
+                    if (!renamePending) {
+                      setRenaming(false);
+                      setRenameValue(name);
+                      setRenameError(null);
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    event.stopPropagation();
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void submitRename();
+                    } else if (event.key === "Escape") {
+                      event.preventDefault();
+                      setRenaming(false);
+                      setRenameValue(name);
+                      setRenameError(null);
+                    }
+                  }}
+                  className="h-6 min-w-0 flex-1 px-1.5 py-0 font-mono text-xs"
+                  aria-label={labels?.rename ?? "Rename"}
+                />
+              ) : (
+                <FileTreeName title={path}>{name}</FileTreeName>
+              )}
+                </div>
+              </ContextMenuTrigger>
+            </CollapsibleTrigger>
+            <ContextMenuContent
+              onCloseAutoFocus={(event) => {
+                if (!contextRenameIntentRef.current) return;
+                event.preventDefault();
+                contextRenameIntentRef.current = false;
+                requestAnimationFrame(() => {
+                  renameInputRef.current?.focus();
+                });
+              }}
+            >
+              <ContextMenuItem onSelect={onCreateFile}>
+                {labels?.newFile ?? "New file"}
+              </ContextMenuItem>
+              <ContextMenuItem onSelect={onCreateFolder}>
+                {labels?.newFolder ?? "New folder"}
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+              {onAdd && (
+                <ContextMenuItem onSelect={() => onAdd(path, "directory")}>
+                  {labels?.addToChat ?? addLabel ?? "Add to chat"}
+                </ContextMenuItem>
+              )}
+              <ContextMenuItem
+                disabled={!onRename || protectedPath}
+                onSelect={beginContextRename}
+              >
+                {labels?.rename ?? "Rename"}
+                <ContextMenuShortcut>F2</ContextMenuShortcut>
+              </ContextMenuItem>
+              <ContextMenuItem
+                variant="destructive"
+                disabled={!onDelete || protectedPath}
+                onSelect={onDelete}
+              >
+                {labels?.delete ?? "Delete"}
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+          {renameError && (
+            <p className="px-8 py-0.5 text-[10px] text-destructive">{renameError}</p>
+          )}
           <CollapsibleContent>
             <div className="ml-4 border-l pl-2">{children}</div>
           </CollapsibleContent>
@@ -198,18 +363,32 @@ export type FileTreeFileProps = HTMLAttributes<HTMLDivElement> & {
   path: string;
   name: string;
   icon?: ReactNode;
+  onRename?: (nextName: string) => Promise<void>;
+  onDelete?: () => void;
+  protectedPath?: boolean;
+  labels?: FileTreeActionLabels;
 };
 
 export const FileTreeFile = ({
   path,
   name,
   icon,
+  onRename,
+  onDelete,
+  protectedPath,
+  labels,
   className,
   children,
   ...props
 }: FileTreeFileProps) => {
-  const { selectedPath, onSelect, onAdd } = useContext(FileTreeContext);
+  const { selectedPath, onSelect, onAdd, addLabel } = useContext(FileTreeContext);
   const isSelected = selectedPath === path;
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(name);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renamePending, setRenamePending] = useState(false);
+  const contextRenameIntentRef = useRef(false);
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   const handleClick = useCallback(() => {
     onSelect?.(path);
@@ -217,59 +396,158 @@ export const FileTreeFile = ({
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.key === "Enter" || e.key === " ") {
+      if (e.key === "F2" && onRename) {
+        e.preventDefault();
+        setRenameValue(name);
+        setRenameError(null);
+        setRenaming(true);
+      } else if (e.key === "Enter" || e.key === " ") {
         onSelect?.(path);
       }
     },
-    [onSelect, path]
-  );
-
-  const handleAdd = useCallback(
-    (e: React.MouseEvent) => {
-      e.stopPropagation();
-      onAdd?.(path);
-    },
-    [onAdd, path]
+    [name, onRename, onSelect, path]
   );
 
   const fileContextValue = useMemo(() => ({ name, path }), [name, path]);
 
+  const beginRename = useCallback(() => {
+    setRenameValue(name);
+    setRenameError(null);
+    setRenaming(true);
+  }, [name]);
+
+  const beginContextRename = useCallback(() => {
+    contextRenameIntentRef.current = true;
+    beginRename();
+  }, [beginRename]);
+
+  const submitRename = useCallback(async () => {
+    const nextName = renameValue.trim();
+    if (!onRename || !nextName || nextName === name) {
+      setRenaming(false);
+      setRenameValue(name);
+      setRenameError(null);
+      return;
+    }
+    setRenamePending(true);
+    setRenameError(null);
+    try {
+      await onRename(nextName);
+      setRenaming(false);
+    } catch (error) {
+      setRenameError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRenamePending(false);
+    }
+  }, [name, onRename, renameValue]);
+
   return (
     <FileTreeFileContext.Provider value={fileContextValue}>
-      <div
-        className={cn(
-          "group/file flex cursor-pointer items-center gap-1 rounded px-2 py-1 transition-colors hover:bg-muted/50",
-          isSelected && "bg-muted",
-          className
-        )}
-        onClick={handleClick}
-        onKeyDown={handleKeyDown}
-        role="treeitem"
-        tabIndex={0}
-        {...props}
-      >
-        {children ?? (
-          <>
-            <FileTreeIcon>
-              {icon ?? <File size={16} className="text-muted-foreground" />}
-            </FileTreeIcon>
-            <FileTreeName>{name}</FileTreeName>
-            {onAdd && (
-              <button
-                type="button"
-                className="ml-auto flex size-5 shrink-0 items-center justify-center rounded opacity-0 transition-opacity hover:bg-muted group-hover/file:opacity-100"
-                onClick={handleAdd}
-                title="Add to chat"
-              >
-                <Plus size={12} className="text-muted-foreground" />
-              </button>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <div
+            className={cn(
+              "group/file flex cursor-pointer items-center gap-1 rounded py-1 pl-1.5 pr-2 transition-colors hover:bg-muted/50",
+              isSelected && "bg-primary/[0.05] text-foreground",
+              className
             )}
-          </>
+            onClick={handleClick}
+            onKeyDown={handleKeyDown}
+            role="treeitem"
+            aria-selected={isSelected}
+            tabIndex={0}
+            {...props}
+          >
+            {children ?? (
+              <>
+                <FileTreeIcon>
+                  {icon ?? <CodePilotIcon name="file" size="md" className="text-muted-foreground" aria-hidden />}
+                </FileTreeIcon>
+                {renaming ? (
+                  <Input
+                    ref={renameInputRef}
+                    autoFocus
+                    value={renameValue}
+                    disabled={renamePending}
+                    onChange={(event) => setRenameValue(event.target.value)}
+                    onClick={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onContextMenu={(event) => event.stopPropagation()}
+                    onBlur={() => {
+                      if (!renamePending) {
+                        setRenaming(false);
+                        setRenameValue(name);
+                        setRenameError(null);
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      event.stopPropagation();
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void submitRename();
+                      } else if (event.key === "Escape") {
+                        event.preventDefault();
+                        setRenaming(false);
+                        setRenameValue(name);
+                        setRenameError(null);
+                      }
+                    }}
+                    className="h-6 min-w-0 flex-1 px-1.5 py-0 font-mono text-xs"
+                    aria-label={labels?.rename ?? "Rename"}
+                  />
+                ) : (
+                  <FileTreeName title={path}>{name}</FileTreeName>
+                )}
+              </>
+            )}
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          onCloseAutoFocus={(event) => {
+            if (!contextRenameIntentRef.current) return;
+            event.preventDefault();
+            contextRenameIntentRef.current = false;
+            requestAnimationFrame(() => {
+              renameInputRef.current?.focus();
+            });
+          }}
+        >
+          {onAdd && (
+            <ContextMenuItem onSelect={() => onAdd(path, "file")}>
+              {labels?.addToChat ?? addLabel ?? "Add to chat"}
+            </ContextMenuItem>
+          )}
+          <ContextMenuItem
+            disabled={!onRename || protectedPath}
+            onSelect={beginContextRename}
+          >
+            {labels?.rename ?? "Rename"}
+            <ContextMenuShortcut>F2</ContextMenuShortcut>
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuItem
+            variant="destructive"
+            disabled={!onDelete || protectedPath}
+            onSelect={onDelete}
+          >
+            {labels?.delete ?? "Delete"}
+          </ContextMenuItem>
+        </ContextMenuContent>
+        {renameError && (
+          <p className="px-8 py-0.5 text-[10px] text-destructive">{renameError}</p>
         )}
-      </div>
+      </ContextMenu>
     </FileTreeFileContext.Provider>
   );
 };
+
+export interface FileTreeActionLabels {
+  newFile: string;
+  newFolder: string;
+  addToChat: string;
+  rename: string;
+  delete: string;
+}
 
 export type FileTreeIconProps = HTMLAttributes<HTMLSpanElement>;
 
@@ -290,7 +568,7 @@ export const FileTreeName = ({
   children,
   ...props
 }: FileTreeNameProps) => (
-  <span className={cn("truncate", className)} {...props}>
+  <span className={cn("min-w-0 truncate", className)} {...props}>
     {children}
   </span>
 );

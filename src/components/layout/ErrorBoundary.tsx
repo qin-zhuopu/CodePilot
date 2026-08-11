@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { WarningCircle } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { useTranslation } from "@/hooks/useTranslation";
+import { captureRendererException } from "@/lib/telemetry/browser";
 
 interface ErrorBoundaryProps {
   children: React.ReactNode;
@@ -13,7 +14,18 @@ interface ErrorBoundaryProps {
 interface ErrorBoundaryState {
   hasError: boolean;
   error: Error | null;
+  /** Number of auto-recovery attempts for DOM errors */
+  domRetries: number;
 }
+
+/** DOM operation errors that can often be recovered by re-rendering */
+const DOM_ERROR_PATTERNS = [
+  'insertBefore',
+  'removeChild',
+  'appendChild',
+  'replaceChild',
+  'is not a child of this node',
+];
 
 /* ── Fallback UI (functional, so it can use hooks) ──────────── */
 
@@ -82,7 +94,7 @@ export class ErrorBoundary extends React.Component<
 > {
   constructor(props: ErrorBoundaryProps) {
     super(props);
-    this.state = { hasError: false, error: null };
+    this.state = { hasError: false, error: null, domRetries: 0 };
   }
 
   static getDerivedStateFromError(error: Error): Partial<ErrorBoundaryState> {
@@ -90,8 +102,23 @@ export class ErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    const msg = error.message || '';
+    const isDomError = DOM_ERROR_PATTERNS.some(p => msg.includes(p));
+
+    // Auto-recover from DOM errors (hydration mismatch, stale node refs)
+    // by clearing the error state and letting React re-render cleanly.
+    // Max 2 retries to prevent infinite loops.
+    if (isDomError && this.state.domRetries < 2) {
+      console.warn("[ErrorBoundary] DOM operation error, auto-recovering:", msg);
+      this.setState(prev => ({ hasError: false, error: null, domRetries: prev.domRetries + 1 }));
+      return;
+    }
+
     console.error("[ErrorBoundary] Uncaught error:", error);
     console.error("[ErrorBoundary] Component stack:", errorInfo.componentStack);
+    // The facade preserves the Error stack for source maps but intentionally
+    // does not attach component-stack text or other renderer state.
+    captureRendererException(error, 'REACT_ERROR_BOUNDARY');
   }
 
   handleReset = () => {

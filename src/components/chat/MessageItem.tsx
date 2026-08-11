@@ -1,23 +1,46 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect, useMemo, memo } from 'react';
-import type { Message, TokenUsage, FileAttachment } from '@/types';
+import { motion } from 'motion/react';
+import { cn } from '@/lib/utils';
+import type { Message, TokenUsage, FileAttachment, MediaBlock, ExternalSource } from '@/types';
 import {
   Message as AIMessage,
   MessageContent,
   MessageResponse,
 } from '@/components/ai-elements/message';
 import { ToolActionsGroup } from '@/components/ai-elements/tool-actions-group';
+import { MediaPreview } from './MediaPreview';
+import { DiffSummary } from './DiffSummary';
 import { Button } from "@/components/ui/button";
-import { Copy, Check, CaretDown, CaretUp } from "@/components/ui/icon";
+import { Check, CaretDown, CaretUp, CaretRight } from "@/components/ui/icon";
+import { CodePilotIcon } from "@/components/ui/semantic-icon";
 import { FileAttachmentDisplay } from './FileAttachmentDisplay';
 import { ImageGenConfirmation } from './ImageGenConfirmation';
 import { ImageGenCard } from './ImageGenCard';
 import { BatchPlanInlinePreview } from './batch-image-gen/BatchPlanInlinePreview';
 import { WidgetRenderer } from './WidgetRenderer';
 import { buildReferenceImages } from '@/lib/image-ref-store';
+import { useTranslation } from '@/hooks/useTranslation';
+// SPECIES_IMAGE_URL / EGG_IMAGE_URL / RARITY_BG_GRADIENT were used by
+// the assistant-chat avatar (removed 2026-05-21); the imports are kept
+// out to avoid stale references.
 import { parseDBDate } from '@/lib/utils';
+import { usePanel } from '@/hooks/usePanel';
+import { classifyPath } from '@/lib/preview-source';
+import { isWriteTool, isCreateTool, extractWritePath, resolveToolPath } from '@/lib/file-write-tools';
+import { archiveHtmlAsset } from '@/lib/archive-html-asset-client';
+import { inspectLocalPath, openHtmlFileWithSystem } from '@/lib/local-path-navigation';
+import { showToast } from '@/hooks/useToast';
+import { DevOutputSegment } from './DevOutputChips';
 import type { PlannerOutput } from '@/types';
+import { SubagentCard } from './SubagentCard';
+import { SearchSources } from './SearchSources';
+import {
+  buildSubagentRunView,
+  collapseLogicalSubagentRuns,
+  isSubagentToolCall,
+} from '@/lib/subagent-view';
 
 interface ImageGenRequest {
   prompt: string;
@@ -142,10 +165,15 @@ export function parseShowWidget(text: string): { beforeText: string; widget: Sho
   for (const seg of segments) {
     if (!foundWidget) {
       if (seg.type === 'text') { beforeText = seg.content; }
-      else { widget = seg.data; foundWidget = true; }
+      else if (seg.type === 'widget') { widget = seg.data; foundWidget = true; }
+      // Legacy parseShowWidget returns only the first SUCCESSFUL
+      // widget — malformed_widget segments are skipped here. The
+      // multi-segment renderer (parseAllShowWidgets caller) still
+      // shows the error block; this legacy wrapper exists for older
+      // call sites that only care about the happy path.
     } else {
       if (seg.type === 'text') afterParts.push(seg.content);
-      else afterParts.push(''); // subsequent widgets handled by parseAllShowWidgets
+      else afterParts.push(''); // subsequent widgets / malformed handled by parseAllShowWidgets
     }
   }
   if (!widget) return null;
@@ -154,61 +182,183 @@ export function parseShowWidget(text: string): { beforeText: string; widget: Sho
 
 export type WidgetSegment =
   | { type: 'text'; content: string }
-  | { type: 'widget'; data: ShowWidgetData };
+  | { type: 'widget'; data: ShowWidgetData }
+  /**
+   * Phase 5c slice 6 (2026-05-16, post-smoke) — emitted when a
+   * `show-widget` marker is in the text but the body cannot be
+   * parsed into the JSON-wrapper wire format (raw HTML / invalid
+   * JSON / missing `widget_code`). Pre-fix all three failure modes
+   * were dropped silently and the chat appeared to have "no widget"
+   * even though the model produced something. The UI now renders
+   * a visible error block so the user can ask the model to fix it.
+   *
+   * `reason` is a short human-readable summary of WHICH failure
+   * mode triggered. `raw` is the original fence body (truncated to
+   * 2 KB) so the user can read it inline without hunting through
+   * the transcript.
+   */
+  | { type: 'malformed_widget'; reason: string; raw: string };
 
-/** Parse ALL show-widget fences in text, returning alternating text/widget segments. */
+/**
+ * Fence-format-agnostic widget parser.
+ *
+ * Models produce many fence variants (```show-widget, `show-widget`, `show-widget\n...\n`, etc.).
+ * Instead of normalizing each variant, we directly scan for "show-widget" markers followed by
+ * JSON containing "widget_code", regardless of surrounding backtick syntax.
+ */
+
+/** Find the end of a JSON object starting at `{`, accounting for nested braces and strings. */
+function findJsonEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && inString) { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1; // unclosed
+}
+
+/** Cap raw fence body before surfacing in a malformed-widget UI segment.
+ *  2 KB is enough to recognise what the model produced without
+ *  bloating the persisted message JSON if the broken fence was huge. */
+function clipMalformedRaw(raw: string): string {
+  const MAX = 2048;
+  if (raw.length <= MAX) return raw;
+  return raw.slice(0, MAX) + '\n[…truncated…]';
+}
+
+/** Parse ALL show-widget blocks in text, returning alternating text/widget segments.
+ *
+ *  Three failure modes used to drop silently — Phase 5c slice 6
+ *  surfaces each as a `malformed_widget` segment so the user knows
+ *  the model tried to make a widget and can ask it to retry:
+ *
+ *    a) marker present but no JSON within 20 chars (the smoke S4
+ *       failure mode: model wrote a raw HTML fence body)
+ *    b) JSON parses successfully but is missing `widget_code`
+ *    c) malformed/unparseable JSON inside the fence
+ */
 export function parseAllShowWidgets(text: string): WidgetSegment[] {
   const segments: WidgetSegment[] = [];
-  const fenceRegex = /```show-widget\s*\n?([\s\S]*?)\n?\s*```/g;
+  // Match any backtick(s) + show-widget, capturing the full marker to strip it
+  const markerRegex = /`{1,3}show-widget`{0,3}\s*(?:\n\s*`{3}(?:json)?\s*)?\n?/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let foundAny = false;
 
-  while ((match = fenceRegex.exec(text)) !== null) {
-    foundAny = true;
-    // Text before this fence
-    const before = text.slice(lastIndex, match.index).trim();
+  /** Push the text slice between the last consumed position and this
+   *  marker, if non-empty. Both the success and the malformed branches
+   *  use this so the preceding prose still renders. */
+  const flushBeforeText = (markerStart: number) => {
+    const before = text.slice(lastIndex, markerStart).trim();
     if (before) segments.push({ type: 'text', content: before });
+  };
 
-    // Parse widget JSON
-    try {
-      const json = JSON.parse(match[1]);
-      if (json.widget_code) {
-        segments.push({ type: 'widget', data: { title: json.title || undefined, widget_code: String(json.widget_code) } });
+  while ((match = markerRegex.exec(text)) !== null) {
+    const afterMarker = match.index + match[0].length;
+    // Find the JSON object start
+    const jsonStart = text.indexOf('{', afterMarker);
+    if (jsonStart === -1 || jsonStart > afterMarker + 20) {
+      // (a) No JSON nearby — surface as malformed_widget so the
+      // user sees the broken fence instead of the chat looking
+      // empty. The smoke S4 failure ended here.
+      const fenceClose = text.indexOf('```', afterMarker);
+      const bodyEnd = fenceClose !== -1 && fenceClose < afterMarker + 4096
+        ? fenceClose
+        : Math.min(text.length, afterMarker + 4096);
+      const raw = text.slice(afterMarker, bodyEnd).trim();
+      foundAny = true;
+      flushBeforeText(match.index);
+      segments.push({
+        type: 'malformed_widget',
+        reason: 'No JSON wrapper found inside `show-widget` fence — the body looked like raw HTML / SVG. Widgets must be wrapped as `{"title":"…","widget_code":"…"}` so the runtime can sandbox them.',
+        raw: clipMalformedRaw(raw),
+      });
+      if (fenceClose !== -1) {
+        lastIndex = fenceClose + 3;
+        markerRegex.lastIndex = fenceClose + 3;
+      } else {
+        lastIndex = bodyEnd;
+        markerRegex.lastIndex = bodyEnd;
       }
-    } catch { /* skip malformed widget */ }
+      continue;
+    }
 
-    lastIndex = match.index + match[0].length;
+    const jsonEnd = findJsonEnd(text, jsonStart);
+    if (jsonEnd === -1) {
+      // Truncated JSON — try extracting partial widget
+      const partialBody = text.slice(jsonStart);
+      const widget = extractTruncatedWidget(partialBody);
+      if (widget) {
+        foundAny = true;
+        flushBeforeText(match.index);
+        segments.push({ type: 'widget', data: widget });
+        lastIndex = text.length;
+      }
+      break;
+    }
+
+    const jsonStr = text.slice(jsonStart, jsonEnd + 1);
+    try {
+      const json = JSON.parse(jsonStr);
+      if (json.widget_code) {
+        foundAny = true;
+        flushBeforeText(match.index);
+        segments.push({ type: 'widget', data: { title: json.title || undefined, widget_code: String(json.widget_code) } });
+        // Skip past the JSON and any trailing fence/backticks
+        let endPos = jsonEnd + 1;
+        const trailing = text.slice(endPos, endPos + 10);
+        const trailingFence = trailing.match(/^\s*\n?`{1,3}\s*/);
+        if (trailingFence) endPos += trailingFence[0].length;
+        lastIndex = endPos;
+        markerRegex.lastIndex = endPos;
+      } else {
+        // (b) JSON parsed but missing `widget_code` — surface as
+        // malformed_widget. Pre-fix this fell through to the
+        // implicit "no segment pushed" path; the user saw nothing.
+        const fenceClose = text.indexOf('```', jsonEnd + 1);
+        const bodyEnd = fenceClose !== -1 ? fenceClose : text.length;
+        foundAny = true;
+        flushBeforeText(match.index);
+        segments.push({
+          type: 'malformed_widget',
+          reason: 'The `show-widget` JSON parsed but did not include a `widget_code` field. The minimal shape is `{"title":"…","widget_code":"<escaped HTML>"}`.',
+          raw: clipMalformedRaw(text.slice(afterMarker, bodyEnd).trim()),
+        });
+        lastIndex = fenceClose !== -1 ? fenceClose + 3 : text.length;
+        markerRegex.lastIndex = lastIndex;
+      }
+    } catch (parseErr) {
+      // (c) Malformed JSON — surface as malformed_widget instead of
+      // skipping. `parseErr` carries the position so the message
+      // can hint at the issue (escape sequence, trailing comma, etc.).
+      const fenceClose = text.indexOf('```', jsonStart);
+      const bodyEnd = fenceClose !== -1 ? fenceClose : text.length;
+      foundAny = true;
+      flushBeforeText(match.index);
+      const errText = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      segments.push({
+        type: 'malformed_widget',
+        reason: `The \`show-widget\` JSON failed to parse: ${errText}. Common causes: unescaped quotes inside \`widget_code\`, unescaped newlines, trailing commas.`,
+        raw: clipMalformedRaw(text.slice(afterMarker, bodyEnd).trim()),
+      });
+      lastIndex = fenceClose !== -1 ? fenceClose + 3 : text.length;
+      markerRegex.lastIndex = lastIndex;
+    }
   }
 
-  if (!foundAny) {
-    // Fallback: handle truncated output (last fence not closed)
-    const fenceStart = text.indexOf('```show-widget');
-    if (fenceStart === -1) return [];
+  if (!foundAny) return [];
 
-    const before = text.slice(0, fenceStart).trim();
-    if (before) segments.push({ type: 'text', content: before });
-
-    const fenceBody = text.slice(fenceStart + '```show-widget'.length).trim();
-    const widget = extractTruncatedWidget(fenceBody);
-    if (widget) segments.push({ type: 'widget', data: widget });
-    return segments;
-  }
-
-  // Remaining text after last fence
+  // Remaining text after last widget
   const remaining = text.slice(lastIndex).trim();
   if (remaining) {
-    // Check if remaining text has a truncated widget fence
-    const truncFenceStart = remaining.indexOf('```show-widget');
-    if (truncFenceStart !== -1) {
-      const beforeTrunc = remaining.slice(0, truncFenceStart).trim();
-      if (beforeTrunc) segments.push({ type: 'text', content: beforeTrunc });
-      const truncBody = remaining.slice(truncFenceStart + '```show-widget'.length).trim();
-      const widget = extractTruncatedWidget(truncBody);
-      if (widget) segments.push({ type: 'widget', data: widget });
-    } else {
-      segments.push({ type: 'text', content: remaining });
-    }
+    segments.push({ type: 'text', content: remaining });
   }
 
   return segments;
@@ -223,9 +373,11 @@ export function parseAllShowWidgets(text: string): WidgetSegment[] {
  * → iframe destroyed → height collapse → scroll jump (P2 regression).
  */
 export function computePartialWidgetKey(content: string): string {
-  const lastFenceStart = content.lastIndexOf('```show-widget');
-  const beforePart = content.slice(0, lastFenceStart).trim();
-  const hasCompletedFences = beforePart.length > 0 && /```show-widget/.test(beforePart);
+  const markers = [...content.matchAll(/`{1,3}show-widget/g)];
+  if (markers.length === 0) return 'w-0';
+  const lastMarker = markers[markers.length - 1];
+  const beforePart = content.slice(0, lastMarker.index).trim();
+  const hasCompletedFences = beforePart.length > 0 && /`{1,3}show-widget/.test(beforePart);
   const completedSegments = hasCompletedFences ? parseAllShowWidgets(beforePart) : [];
   return `w-${hasCompletedFences ? completedSegments.length : (beforePart ? 1 : 0)}`;
 }
@@ -256,6 +408,7 @@ function extractTruncatedWidget(fenceBody: string): ShowWidgetData | null {
       .replace(/\\t/g, '\t')
       .replace(/\\r/g, '\r')
       .replace(/\\"/g, '"')
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
       .replace(/\x00BACKSLASH\x00/g, '\\');
     if (widgetCode.length < 10) return null;
 
@@ -271,6 +424,10 @@ function extractTruncatedWidget(fenceBody: string): ShowWidgetData | null {
 interface MessageItemProps {
   message: Message;
   sessionId?: string;
+  /** Whether this is an assistant workspace project */
+  isAssistantProject?: boolean;
+  /** Assistant name for avatar */
+  assistantName?: string;
 }
 
 interface ToolBlock {
@@ -280,11 +437,14 @@ interface ToolBlock {
   input?: unknown;
   content?: string;
   is_error?: boolean;
+  media?: MediaBlock[];
+  sources?: ExternalSource[];
 }
 
-function parseToolBlocks(content: string): { text: string; tools: ToolBlock[] } {
+function parseToolBlocks(content: string): { text: string; tools: ToolBlock[]; thinking?: string } {
   const tools: ToolBlock[] = [];
   let text = '';
+  let thinking: string | undefined;
 
   // Try to parse as JSON array (new format from chat API)
   if (content.startsWith('[')) {
@@ -292,6 +452,7 @@ function parseToolBlocks(content: string): { text: string; tools: ToolBlock[] } 
       const blocks = JSON.parse(content) as Array<{
         type: string;
         text?: string;
+        thinking?: string;
         id?: string;
         name?: string;
         input?: unknown;
@@ -299,9 +460,11 @@ function parseToolBlocks(content: string): { text: string; tools: ToolBlock[] } 
         content?: string;
         is_error?: boolean;
       }>;
-      
+
       for (const block of blocks) {
-        if (block.type === 'text' && block.text) {
+        if (block.type === 'thinking' && block.thinking) {
+          thinking = block.thinking;
+        } else if (block.type === 'text' && block.text) {
           text += block.text;
         } else if (block.type === 'tool_use') {
           tools.push({
@@ -316,11 +479,13 @@ function parseToolBlocks(content: string): { text: string; tools: ToolBlock[] } 
             id: block.tool_use_id,
             content: block.content,
             is_error: block.is_error,
+            media: (block as { media?: MediaBlock[] }).media,
+            sources: (block as { sources?: ExternalSource[] }).sources,
           });
         }
       }
-      
-      return { text: text.trim(), tools };
+
+      return { text: text.trim(), tools, thinking };
     } catch {
       // Not valid JSON, fall through to legacy parsing
     }
@@ -355,16 +520,22 @@ function parseToolBlocks(content: string): { text: string; tools: ToolBlock[] } 
 }
 
 function pairTools(tools: ToolBlock[]): Array<{
+  id: string;
   name: string;
   input: unknown;
   result?: string;
   isError?: boolean;
+  media?: MediaBlock[];
+  sources?: ExternalSource[];
 }> {
   const paired: Array<{
+    id: string;
     name: string;
     input: unknown;
     result?: string;
     isError?: boolean;
+    media?: MediaBlock[];
+    sources?: ExternalSource[];
   }> = [];
 
   const resultMap = new Map<string, ToolBlock>();
@@ -378,10 +549,13 @@ function pairTools(tools: ToolBlock[]): Array<{
     if (t.type === 'tool_use' && t.name) {
       const result = t.id ? resultMap.get(t.id) : undefined;
       paired.push({
+        id: t.id || `tool-${paired.length}`,
         name: t.name,
         input: t.input,
         result: result?.content,
         isError: result?.is_error,
+        media: result?.media,
+        sources: result?.sources,
       });
     }
   }
@@ -389,10 +563,13 @@ function pairTools(tools: ToolBlock[]): Array<{
   for (const t of tools) {
     if (t.type === 'tool_result' && !tools.some(u => u.type === 'tool_use' && u.id === t.id)) {
       paired.push({
+        id: t.id || `tool-result-${paired.length}`,
         name: 'tool_result',
         input: {},
         result: t.content,
         isError: t.is_error,
+        media: t.media,
+        sources: t.sources,
       });
     }
   }
@@ -436,7 +613,7 @@ function CopyButton({ text }: { text: string }) {
       {copied ? (
         <Check size={12} className="text-status-success-foreground" />
       ) : (
-        <Copy size={12} />
+        <CodePilotIcon name="copy" size={12} aria-hidden />
       )}
     </Button>
   );
@@ -462,20 +639,41 @@ function TokenUsageDisplay({ usage }: { usage: TokenUsage }) {
 
 const COLLAPSE_HEIGHT = 300;
 
-export const MessageItem = memo(function MessageItem({ message, sessionId }: MessageItemProps) {
+export const MessageItem = memo(function MessageItem({ message, sessionId, isAssistantProject, assistantName }: MessageItemProps) {
   const isUser = message.role === 'user';
+  const { t } = useTranslation();
 
   // Collapse/expand state for long user messages (hooks must be called unconditionally)
   const [isExpanded, setIsExpanded] = useState(false);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
 
+  // Preview wiring for DiffSummary (Phase 2.3). Clicking a previewable row
+  // opens the artifact panel on that file. setPreviewSource auto-flips
+  // previewOpen (see AppShell.tsx setPreviewSource side effects) so callers
+  // don't need to set both.
+  const { setPreviewSource, workingDirectory } = usePanel();
+
+
   // Memoize expensive parsing: parseToolBlocks + pairTools
-  const { text, pairedTools } = useMemo(() => {
-    const { text, tools } = parseToolBlocks(message.content);
+  const { text, pairedTools, thinking } = useMemo(() => {
+    const { text, tools, thinking } = parseToolBlocks(message.content);
     const pairedTools = pairTools(tools);
-    return { text, pairedTools };
+    return { text, pairedTools, thinking };
   }, [message.content]);
+  const subagentTools = pairedTools.filter(tool => (
+    isSubagentToolCall(tool.name, tool.input, tool.result)
+  ));
+  const subagentRuns = collapseLogicalSubagentRuns(subagentTools.map(tool => buildSubagentRunView({
+    id: tool.id,
+    name: tool.name,
+    toolInput: tool.input,
+    result: tool.result,
+    isError: tool.isError,
+  })));
+  const regularTools = pairedTools.filter(tool => (
+    !isSubagentToolCall(tool.name, tool.input, tool.result)
+  ));
 
   // Memoize file attachment parsing
   const { files, displayText } = useMemo(() => {
@@ -512,7 +710,16 @@ export const MessageItem = memo(function MessageItem({ message, sessionId }: Mes
     minute: '2-digit',
   });
 
+  // Assistant chat avatar removed (2026-05-21) — message bubbles already
+  // carry assistant/user attribution via tone + alignment; the buddy
+  // egg/species portrait next to every AI reply was visual noise and
+  // duplicated identity already shown elsewhere (sidebar, composer
+  // header). `isAssistantProject` is kept on the props since other
+  // assistant-aware paths in this file may still reference it.
+
   return (
+    <div>
+      <div className="flex-1 min-w-0">
     <AIMessage from={isUser ? 'user' : 'assistant'}>
       <MessageContent>
         {/* File attachments for user messages */}
@@ -520,36 +727,58 @@ export const MessageItem = memo(function MessageItem({ message, sessionId }: Mes
           <FileAttachmentDisplay files={files} />
         )}
 
-        {/* Tool calls for assistant messages — compact collapsible group */}
-        {!isUser && pairedTools.length > 0 && (
+        {/* Tool calls + thinking for assistant messages — single collapsible group */}
+        {!isUser && (regularTools.length > 0 || thinking) && (
           <ToolActionsGroup
-            tools={pairedTools.map((tool, i) => ({
-              id: `hist-${i}`,
+            tools={regularTools.map((tool) => ({
+              id: tool.id,
               name: tool.name,
               input: tool.input,
               result: tool.result,
               isError: tool.isError,
+              media: tool.media,
             }))}
+            thinkingContent={thinking}
           />
+        )}
+
+        {/* Media from tool results — rendered outside tool group so images stay visible */}
+        {!isUser && (() => {
+          const allMedia = pairedTools.flatMap(t => t.media || []);
+          return allMedia.length > 0 ? <MediaPreview media={allMedia} /> : null;
+        })()}
+
+        {!isUser && (
+          <SearchSources sources={pairedTools.flatMap(tool => tool.sources || [])} />
         )}
 
         {/* Text content */}
         {displayText && (
           isUser ? (
             <div className="relative">
-              <div
+              {/* Round 14 (2026-05-23): switched the long-message
+                  collapse from a CSS `transition: max-height` to
+                  framer-motion `animate={{ height }}`. The CSS path
+                  toggled between `maxHeight: 300px` and `undefined`
+                  (== auto), which cannot interpolate — so expanding
+                  and collapsing snapped instantly and looked like a
+                  jarring flicker. motion.div measures the real
+                  content height at run-time and tweens between the
+                  collapsed pixel value and "auto" smoothly.
+                  `initial={false}` skips a play on first paint so
+                  long messages don't unfurl when they're rendered.
+                  `overflow: hidden` clips the in-flight measure. */}
+              <motion.div
                 ref={contentRef}
-                className="text-sm whitespace-pre-wrap break-words transition-[max-height] duration-300 ease-in-out overflow-hidden"
-                style={
-                  isOverflowing && !isExpanded
-                    ? { maxHeight: `${COLLAPSE_HEIGHT}px` }
-                    : undefined
-                }
+                className="text-sm whitespace-pre-wrap break-words overflow-hidden"
+                initial={false}
+                animate={{ height: isOverflowing && !isExpanded ? COLLAPSE_HEIGHT : "auto" }}
+                transition={{ duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
               >
                 {displayText}
-              </div>
+              </motion.div>
               {isOverflowing && !isExpanded && (
-                <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-secondary to-transparent pointer-events-none" />
+                <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-muted to-transparent pointer-events-none" />
               )}
               {isOverflowing && (
                 <Button
@@ -574,7 +803,160 @@ export const MessageItem = memo(function MessageItem({ message, sessionId }: Mes
             </div>
           ) : <AssistantContent displayText={displayText} messageId={message.id} sessionId={sessionId} />
         )}
+
+        {/* Compact Sub Agent capsules follow the assistant text and wrap on one
+            row when space allows. */}
+        {!isUser && subagentRuns.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {subagentRuns.map(run => (
+              <SubagentCard
+                key={run.id}
+                run={run}
+                sessionId={sessionId}
+              />
+            ))}
+          </div>
+        )}
+
+        {!isUser && message.stream_status && message.stream_status !== 'completed' && (
+          <div
+            className={cn(
+              'mt-2 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs',
+              message.stream_status === 'streaming'
+                ? 'border-border bg-muted/50 text-muted-foreground'
+                : message.stream_status === 'interrupted'
+                  ? 'border-status-warning-border bg-status-warning-muted text-status-warning-foreground'
+                  : 'border-status-error-border bg-status-error-muted text-status-error-foreground',
+            )}
+            role="status"
+          >
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                message.stream_status === 'streaming'
+                  ? 'animate-pulse bg-muted-foreground'
+                  : message.stream_status === 'interrupted'
+                    ? 'bg-status-warning'
+                    : 'bg-status-error',
+              )}
+              aria-hidden
+            />
+            {t(`message.streamStatus.${message.stream_status}`)}
+          </div>
+        )}
       </MessageContent>
+
+      {/* Diff summary for assistant messages with file modifications */}
+      {!isUser && (() => {
+        // Phase 4: write-tool classification + path resolution now live
+        // in `src/lib/file-write-tools.ts` so the same set powers both
+        // the DiffSummary cards here and the codepilot:file-changed
+        // dispatch in stream-session-manager. Anywhere a new variant
+        // (e.g. multi_edit) lands, both surfaces pick it up.
+        const modifiedFiles = pairedTools
+          .filter(t => isWriteTool(t.name) && !t.isError)
+          .map(t => {
+            const rawPath = extractWritePath(t.input);
+            const resolvedPath = resolveToolPath(rawPath, workingDirectory);
+            const parts = resolvedPath.split(/[/\\]/);
+            const operation: 'created' | 'modified' = isCreateTool(t.name) ? 'created' : 'modified';
+            const archiveable =
+              classifyPath(resolvedPath, workingDirectory).trust === 'workspace';
+            return {
+              path: resolvedPath,
+              name: parts[parts.length - 1] || resolvedPath,
+              operation,
+              archiveable,
+            };
+          })
+          .filter(f => f.path);
+        if (modifiedFiles.length === 0) return null;
+        // Deduplicate by path. When the same file appears multiple times (e.g.
+        // created then edited in one turn), the last tool wins — callers see
+        // "Modified" rather than "Created" which matches the file's final
+        // state at the end of the turn.
+        const unique = [...new Map(modifiedFiles.map(f => [f.path, f])).values()];
+        return (
+          <DiffSummary
+            files={unique}
+            onPreview={(file) => {
+              // Phase 4: classify the path against the session's
+              // workingDirectory. Inside the workspace → workspace trust
+              // + baseDir, opens directly. Outside → agent-referenced,
+              // which makes PreviewPanel render a confirm card and
+              // delay fetch until the user explicitly accepts (path
+              // could be a sensitive location named by the AI). The
+              // panel transitions to user-selected/readonly on confirm.
+              const { trust, baseDir, readonly } = classifyPath(file.path, workingDirectory);
+              setPreviewSource({
+                kind: 'file',
+                filePath: file.path,
+                trust,
+                ...(baseDir ? { baseDir } : {}),
+                readonly,
+              });
+            }}
+            onOpenInSystemBrowser={async (file) => {
+              try {
+                if (!sessionId) throw new Error(t('localReference.unsupported'));
+                const inspection = await inspectLocalPath(file.path, { sessionId });
+                if (inspection.kind !== 'file') {
+                  throw new Error(t('localReference.unsupported'));
+                }
+                await openHtmlFileWithSystem({
+                  path: inspection.realPath,
+                  sessionId,
+                });
+              } catch (error) {
+                showToast({
+                  type: 'error',
+                  message: t('diffSummary.openSystemBrowserFailed', {
+                    reason: error instanceof Error ? error.message : String(error),
+                  }),
+                });
+              }
+            }}
+            // Phase 3: export long screenshot via the Electron IPC. Only
+            // .html/.htm rows pass the PREVIEWABLE+LONGSHOT gate in
+            // DiffSummary; for those, we fetch the raw file contents from
+            // /api/files/preview and hand them to the long-shot helper.
+            // Markdown / JSX long-shot support requires a prior render-
+            // to-HTML step (Streamdown serialize for .md; esbuild compile
+            // for .tsx) that's Phase 3 follow-up — DiffSummary already
+            // gates the button by extension so we won't get called for
+            // those unless the gate changes later.
+            onExportLongShot={async (file) => {
+              try {
+                const { exportHtmlAsLongShot } = await import('@/lib/artifact-export');
+                const qs = new URLSearchParams({ path: file.path });
+                if (workingDirectory) qs.set('baseDir', workingDirectory);
+                const res = await fetch(`/api/files/preview?${qs}`);
+                if (!res.ok) {
+                  const data = await res.json().catch(() => ({}));
+                  alert(`Export failed: ${data.error || res.status}`);
+                  return;
+                }
+                const { preview } = await res.json();
+                await exportHtmlAsLongShot({
+                  html: preview.content,
+                  filename: file.name.replace(/\.[^.]+$/, ''),
+                  width: 1024,
+                });
+              } catch (err) {
+                alert(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }}
+            onArchiveHtml={sessionId ? async (file) => {
+              await archiveHtmlAsset({
+                sessionId,
+                source: 'workspace',
+                filePath: file.path,
+                prompt: file.name,
+              });
+            } : undefined}
+          />
+        );
+      })()}
 
       {/* Footer with copy, timestamp and token usage */}
       <div className={`flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200 ${isUser ? 'justify-end' : ''}`}>
@@ -583,8 +965,112 @@ export const MessageItem = memo(function MessageItem({ message, sessionId }: Mes
         {displayText && <CopyButton text={displayText} />}
       </div>
     </AIMessage>
+      </div>
+    </div>
   );
 });
+
+/**
+ * Phase 5c slice 6 (2026-05-16, post-smoke) — visible error block
+ * for `show-widget` fences the parser couldn't render. Surfaces
+ * three failure modes:
+ *   - raw HTML body (no JSON wrapper) — the S4 smoke failure
+ *   - JSON parsed but no `widget_code` field
+ *   - JSON itself malformed
+ *
+ * Each case lands here with a structured `reason` and the original
+ * fence body so the user can read it inline and ask the model to
+ * retry. Pre-fix the chat looked empty in all three cases.
+ */
+export function MalformedWidgetNotice({ reason, raw }: { reason: string; raw: string }) {
+  const [showRaw, setShowRaw] = useState(false);
+  return (
+    <div className="my-3 rounded-md border border-status-warning-border bg-status-warning-muted p-3 text-sm">
+      <div className="font-medium text-status-warning-foreground">Malformed `show-widget` block</div>
+      <div className="mt-1 text-status-warning-foreground/80">{reason}</div>
+      <button
+        type="button"
+        className="mt-2 text-xs text-status-warning-foreground underline-offset-2 hover:underline"
+        onClick={() => setShowRaw(s => !s)}
+      >
+        {showRaw ? 'Hide source' : 'Show source'}
+      </button>
+      {showRaw && (
+        <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-background p-2 text-xs">
+          {raw}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/** Widget wrapper with "Pin to Dashboard" button.
+ * Pin triggers a chat message → AI uses codepilot_dashboard_pin MCP tool.
+ * Button is a pure trigger — no local pin/unpin state tracking.
+ * Brief cooldown prevents double-click. */
+function PinnableWidget({ widgetCode, title }: {
+  widgetCode: string; title?: string; messageId: string; sessionId?: string;
+}) {
+  const [cooldown, setCooldown] = useState(false);
+  const { workingDirectory } = usePanel();
+
+  const handlePin = useCallback(() => {
+    if (cooldown || !workingDirectory) return;
+    setCooldown(true);
+    window.dispatchEvent(new CustomEvent('widget-pin-request', {
+      detail: { widgetCode, title: title || 'Untitled Widget' },
+    }));
+    // 5s cooldown to prevent rapid duplicate pins
+    setTimeout(() => setCooldown(false), 5000);
+  }, [cooldown, workingDirectory, widgetCode, title]);
+
+  const handleExport = useCallback(async () => {
+    try {
+      const { exportWidgetAsImage, downloadBlob } = await import('@/lib/dashboard-export');
+      const blob = await exportWidgetAsImage(widgetCode);
+      downloadBlob(blob, `${(title || 'widget').replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '_')}.png`);
+    } catch (e) {
+      console.error('[PinnableWidget] Export failed:', e);
+    }
+  }, [widgetCode, title]);
+
+  // Card action button class — shared geometry / colors used by widget
+  // toolbar and (round 12 onwards) the Markdown table + code block
+  // toolbars. h-7 / text-xs / rounded-md gives a readable hit target
+  // without dominating the card chrome. Permanent (no opacity-0
+  // hover gate) per round 12 design refresh.
+  // `justify-center` (round 13) keeps the icon centered inside
+  // icon-only variants (h-7 w-7 px-0). Without it, the icon hugs
+  // the button's left edge and the hover background visibly offsets
+  // from the glyph.
+  const cardActionBtn = "h-7 px-2 gap-1 inline-flex items-center justify-center rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40 disabled:pointer-events-none";
+
+  const buttons = (
+    <>
+      {workingDirectory && (
+        <button
+          className={cardActionBtn}
+          onClick={handlePin}
+          disabled={cooldown}
+        >
+          <CodePilotIcon name="pin" size="sm" aria-hidden />
+          Pin
+        </button>
+      )}
+      <button
+        className={cn(cardActionBtn, "h-7 w-7 px-0")}
+        onClick={handleExport}
+        aria-label="Export PNG"
+      >
+        <CodePilotIcon name="download" size="sm" aria-hidden />
+      </button>
+    </>
+  );
+
+  return (
+    <WidgetRenderer widgetCode={widgetCode} isStreaming={false} title={title} extraButtons={buttons} />
+  );
+}
 
 /**
  * Memoized assistant message content — avoids re-running parseBatchPlan / parseImageGenResult /
@@ -597,11 +1083,15 @@ const AssistantContent = memo(function AssistantContent({ displayText, messageId
     if (widgetSegments.length > 0) {
       return (
         <>
-          {widgetSegments.map((seg, i) =>
-            seg.type === 'text'
-              ? <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>
-              : <WidgetRenderer key={`w-${i}`} widgetCode={seg.data.widget_code} isStreaming={false} title={seg.data.title} />
-          )}
+          {widgetSegments.map((seg, i) => {
+            if (seg.type === 'text') {
+              return <MessageResponse key={`t-${i}`}>{seg.content}</MessageResponse>;
+            }
+            if (seg.type === 'malformed_widget') {
+              return <MalformedWidgetNotice key={`mw-${i}`} reason={seg.reason} raw={seg.raw} />;
+            }
+            return <PinnableWidget key={`w-${i}`} widgetCode={seg.data.widget_code} title={seg.data.title} messageId={messageId} sessionId={sessionId} />;
+          })}
         </>
       );
     }
@@ -638,7 +1128,7 @@ const AssistantContent = memo(function AssistantContent({ displayText, messageId
         return (
           <>
             {genResult.beforeText && <MessageResponse>{genResult.beforeText}</MessageResponse>}
-            <div className="rounded-md border border-red-200 bg-red-50 dark:border-red-800 dark:bg-red-950/30 p-3">
+            <div className="rounded-md border border-status-error-border bg-status-error-muted p-3">
               <p className="text-sm text-status-error-foreground">{result.error || 'Image generation failed'}</p>
             </div>
             {genResult.afterText && <MessageResponse>{genResult.afterText}</MessageResponse>}
@@ -697,6 +1187,11 @@ const AssistantContent = memo(function AssistantContent({ displayText, messageId
       .replace(/```batch-plan[\s\S]*?```/g, '')
       .replace(/```show-widget[\s\S]*?(```|$)/g, '')
       .trim();
-    return stripped ? <MessageResponse>{stripped}</MessageResponse> : null;
+    // Phase 4.D — DevOutputSegment tokenizes the assistant text for
+    // file references (/abs/path:12, foo.md#L12) and localhost URLs,
+    // rendering them as clickable chips alongside the streamdown
+    // markdown render. Plain text without dev-output tokens falls
+    // through to a normal <MessageResponse> with zero overhead.
+    return stripped ? <DevOutputSegment text={stripped} /> : null;
   }, [displayText, messageId, sessionId]);
 });

@@ -8,6 +8,7 @@ directories:
   output: release
 files:
   - dist-electron/**/*
+  - "!dist-electron/**/*.map"
   - "!node_modules"
   - "!src"
   - "!electron"
@@ -21,27 +22,45 @@ extraResources:
   - from: .next/standalone/
     to: standalone/
     filter:
-      - "**/*"
-      - "!node_modules"
-      - "!release"
+      # Root runtime files only. Keep this set disjoint from the dedicated
+      # node_modules/ and .next/ FileSets below: electron-builder copies
+      # extraResources concurrently, and overlapping destinations can race on
+      # Windows with EBUSY while signing/copying the same file.
+      - "server.js"
+      - "package.json"
+      - "cache-handler.js"
   - from: .next/standalone/node_modules/
     to: standalone/node_modules/
-    filter: ["**/*"]
+    filter: ["**/*", "!**/*.map"]
   - from: .next/standalone/.next/
     to: standalone/.next/
-    filter: ["**/*"]
+    filter:
+      # electron-builder always filters a FileSet's root node_modules directory.
+      # Keep it explicitly disjoint here and copy it with the dedicated FileSet
+      # below so Next's hashed external-module aliases reach the packaged app.
+      - "**/*"
+      - "!node_modules{,/**/*}"
+      - "!**/*.map"
+  - from: .next/standalone/.next/node_modules/
+    to: standalone/.next/node_modules/
+    filter: ["**/*", "!**/*.map"]
   - from: .next/static/
     to: standalone/.next/static/
-    filter: ["**/*"]
+    filter: ["**/*", "!**/*.map"]
   - from: public/
     to: standalone/public/
     filter: ["**/*"]
   - from: themes/
     to: standalone/themes/
     filter: ["*.json"]
+  - from: resources/macos-keychain-guard/
+    to: macos-keychain-guard/
+    filter: ["security"]
   - from: build/
     to: .
-    filter: ["icon.*"]
+    # icon.* = Dock/app/window icons; trayTemplate*.png = macOS menubar template
+    # (16x16 + @2x retina). Both land at process.resourcesPath root.
+    filter: ["icon.*", "trayTemplate*.png"]
 afterPack: scripts/after-pack.js
 afterSign: scripts/after-sign.js
 asarUnpack:
@@ -57,22 +76,22 @@ mac:
   entitlementsInherit: build/entitlements.mac.inherit.plist
   notarize: false
   target:
-    - target: dmg
-      arch: [x64, arm64]
-    - target: zip
-      arch: [x64, arm64]
+    - dmg
+    - zip
 win:
   icon: build/icon.ico
   target:
-    - target: nsis
-      arch: [x64, arm64]
+    - nsis
 nsis:
   oneClick: false
   perMachine: false
-  allowToChangeInstallationDirectory: false
+  # Let users pick the install location — Windows feedback: the installer
+  # offered no path choice. Requires oneClick:false (kept above).
+  allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
   deleteAppDataOnUninstall: false
+  artifactName: "${productName}.Setup.${version}.${ext}"
 linux:
   icon: build/icon.png
   category: Development

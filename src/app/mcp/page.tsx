@@ -1,13 +1,17 @@
 "use client";
 
-import { McpManager } from "@/components/plugins/McpManager";
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
 
-export default function McpPage() {
-  return (
-    <div className="flex h-full flex-col">
-      <div className="flex-1 overflow-hidden p-6 flex flex-col min-h-0">
-        <McpManager />
-      </div>
-    </div>
-  );
+/**
+ * Phase 2D.4 (2026-05-01): `/mcp` is now a deep link into the unified
+ * `/plugins` page. Kept as a thin redirect for one release so existing
+ * bookmarks / tests don't 404; the file will be deleted in the next cleanup.
+ */
+export default function McpRedirect() {
+  const router = useRouter();
+  useEffect(() => {
+    router.replace("/plugins#mcp");
+  }, [router]);
+  return null;
 }

@@ -1,4 +1,3 @@
-import Link from 'next/link';
 import Image from 'next/image';
 import type { MarketingContent } from '../../../content/marketing/en';
 import { ChatDemo } from './ChatDemo';
@@ -13,8 +12,6 @@ export function HeroSection({
   content: MarketingContent['hero'];
   locale: string;
 }) {
-  const prefix = locale === 'en' ? '' : `/${locale}`;
-
   return (
     <section className="relative overflow-hidden">
       {/* Blue-gray gradient background */}
@@ -23,6 +20,33 @@ export function HeroSection({
       <div className="relative">
         {/* Logo + Title + CTA */}
         <div className="mx-auto max-w-[800px] px-6 pt-8 text-center md:pt-10 lg:pt-12">
+          {content.notice ? (
+            <a
+              href={content.notice.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="group mx-auto mb-7 block max-w-3xl rounded-lg bg-[linear-gradient(90deg,hsl(var(--color-1)),hsl(var(--color-5)),hsl(var(--color-3)),hsl(var(--color-4)),hsl(var(--color-2)))] p-px text-left shadow-sm transition-transform hover:-translate-y-0.5"
+            >
+              <div className="rounded-[7px] bg-background/95 px-5 py-4 backdrop-blur">
+                <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-sm font-semibold text-foreground sm:justify-start">
+                  <span aria-hidden="true">🚧</span>
+                  <span>{content.notice.label}</span>
+                  <span className="text-primary transition-colors group-hover:text-foreground">
+                    {content.notice.cta}
+                  </span>
+                </div>
+                <p className="mt-3 text-[15px] leading-relaxed text-muted-foreground">
+                  <span className="font-semibold text-foreground">EN</span>{' '}
+                  {content.notice.english}
+                </p>
+                <p className="mt-1.5 text-[15px] leading-relaxed text-muted-foreground">
+                  <span className="font-semibold text-foreground">中文</span>{' '}
+                  {content.notice.chinese}
+                </p>
+              </div>
+            </a>
+          ) : null}
+
           <Image
             src="/logo.png"
             alt="CodePilot"
@@ -38,11 +62,11 @@ export function HeroSection({
           </h1>
 
           <div className="mt-7 flex items-center justify-center">
-            <Link href={`${prefix}/docs/installation`}>
+            <a href="https://github.com/op7418/CodePilot/releases/latest" target="_blank" rel="noopener noreferrer">
               <RainbowButton className="h-14 rounded-full px-14 text-lg">
                 {content.cta}
               </RainbowButton>
-            </Link>
+            </a>
           </div>
         </div>
 

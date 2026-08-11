@@ -46,13 +46,20 @@ next-env.d.ts
 # electron
 /dist-electron/
 /release/
+/release-*/
 
 # test artifacts
 /playwright-report/
 /test-results/
+# Playwright visual regression snapshots are machine-specific (suffix is
+# darwin/linux/etc) and regenerate on demand — don't commit them.
+src/__tests__/e2e/*-snapshots/
 
 # user uploads (runtime data)
 .codepilot-uploads/
+
+# local runtime artifacts
+.codepilot/
 
 # monorepo: site app build artifacts
 apps/site/.next/
@@ -61,3 +68,13 @@ apps/site/node_modules/
 
 # claude code session data
 .claude/
+
+# AI agent skills (installed via `npx skills add ...`) — local tooling only
+.agents/
+.pi/
+/skills/
+skills-lock.json
+
+# Codex Runtime reference material — clone locally per Phase 5 plan
+# (git clone --depth 1 https://github.com/openai/codex.git 资料/codex)
+资料/codex/
