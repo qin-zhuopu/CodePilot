@@ -1,47 +1,66 @@
 # syntax=docker/dockerfile:1
 # CodePilot Web —— 容器内多阶段构建
 #
-# 基础镜像特殊点(踩坑记录):
-#   1. 默认用户是 dev (uid 1001, 非 root),无法写 /data,数据目录用 /app/data
-#   2. node 通过 nvm 安装,PATH 需显式包含 nvm bin 目录
-#   3. 基础镜像 ENTRYPOINT 是 /bin/zsh,必须清空,否则 `node server.js` 被当文件名打开
+# 基础镜像: harbor.jereh.cn/base/node:22(内部 Node.js 22 镜像)
 #
 # 构建参数(可用 --build-arg 覆盖):
+#   NPM_REGISTRY     —— npm registry(默认内网 nexus,可传入其他地址覆盖)
 #   HTTP_PROXY_URL   —— better-sqlite3 预编译二进制走 GitHub 下载所需代理
-#   NPM_REGISTRY     —— npm registry(默认 npmmirror,避开内网 nexus 超时)
 
-ARG BASE_IMAGE=harbor.jereh.cn/base/ubuntu:24.04-node22-python312
+ARG BASE_IMAGE=harbor.jereh.cn/base/node:22
 
 # ============================================================
 # Stage 1: builder —— 容器内安装依赖 + 构建 Next.js standalone
 # ============================================================
 FROM ${BASE_IMAGE} AS builder
 
+# 构建参数仅作为默认值 / fallback(未传 secret 时使用)。
+# 值本身不出现在镜像层中,只有被 secret mount 读取过才会留痕迹。
 ARG HTTP_PROXY_URL=http://172.24.0.5:3128
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 
-# nvm 的 node 加入 PATH
-ENV PATH="/home/dev/.nvm/versions/node/v22.22.0/bin:${PATH}"
-# 注意:不要设 NODE_ENV=development —— 它会污染 next build,让 React 加载 dev
-# 构建,导致 /_global-error 静态预渲染崩溃(useContext of null)。npm install
-# 默认就会安装 devDependencies,无需设置 NODE_ENV。
-# better-sqlite3 预编译下载走代理;electron 桌面二进制在 web 部署里用不到,跳过
-ENV http_proxy=${HTTP_PROXY_URL} \
-    https_proxy=${HTTP_PROXY_URL} \
+ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY} \
     ELECTRON_SKIP_BINARY_DOWNLOAD=1
 
 WORKDIR /app
 
 # 先只 COPY 依赖清单,利用 Docker 层缓存(依赖没变则不重装)
-COPY --chown=dev:dev package.json package-lock.json* ./
-COPY --chown=dev:dev apps/site/package.json ./apps/site/package.json
+COPY package.json package-lock.json* ./
+COPY apps/site/package.json ./apps/site/package.json
 
-# npm install:npmmirror 快;better-sqlite3/zlib-sync 预编译失败时,镜像自带
-# g++/make/python3 可兜底本地编译(node-gyp)。electron 二进制已跳过。
-RUN npm install --registry=${NPM_REGISTRY} --fetch-timeout=120000 --fetch-retries=5
+# 1) 安装依赖。从 secret 读取 NPM_REGISTRY 覆盖 ENV 默认值,
+#    未传 secret 则走 ENV 中 ARG 的默认值。
+#    --ignore-scripts: 跳过 better-sqlite3 postinstall(prebuild-install/node-gyp),
+#    避免在容器内触发编译或网络下载。
+RUN --mount=type=secret,id=npm_registry,dst=/run/secrets/npm_registry \
+    --mount=type=cache,target=/root/.npm \
+    NPM_REGISTRY=$(\
+      [ -f /run/secrets/npm_registry ] \
+      && cat /run/secrets/npm_registry \
+      || echo "${NPM_REGISTRY}" \
+    ); \
+    npm ci -d --ignore-scripts --fetch-timeout=120000 --fetch-retries=5 \
+      --registry=${NPM_REGISTRY:-$NPM_CONFIG_REGISTRY}
 
-# COPY 源码并构建。registry 需为 build 期可能触发的按需安装保持一致。
-COPY --chown=dev:dev . .
+# 2) 预下载 better-sqlite3 预编译二进制并解压到位。
+#    curl 走代理(从 secret 读取 HTTP_PROXY_URL)。
+#    未传 secret 则走 ARG 默认值。
+RUN --mount=type=secret,id=http_proxy,dst=/run/secrets/http_proxy \
+    HTTP_PROXY_URL=$(\
+      [ -f /run/secrets/http_proxy ] \
+      && cat /run/secrets/http_proxy \
+      || echo "${HTTP_PROXY_URL}" \
+    ) && \
+    mkdir -p node_modules/better-sqlite3/build/Release && \
+    HTTP_PROXY=${HTTP_PROXY_URL} HTTPS_PROXY=${HTTP_PROXY_URL} \
+    curl -fSL --connect-timeout 30 --max-time 300 \
+      -o /tmp/better-sqlite3-prebuild.tar.gz \
+      https://github.com/WiseLibs/better-sqlite3/releases/download/v12.6.2/better-sqlite3-v12.6.2-node-v127-linux-x64.tar.gz && \
+    tar xzf /tmp/better-sqlite3-prebuild.tar.gz -C /tmp && \
+    mv /tmp/build/Release/better_sqlite3.node node_modules/better-sqlite3/build/Release/
+
+# COPY 源码并构建。
+COPY . .
 RUN npm run build
 
 # ============================================================
@@ -49,7 +68,6 @@ RUN npm run build
 # ============================================================
 FROM ${BASE_IMAGE} AS runtime
 
-ENV PATH="/home/dev/.nvm/versions/node/v22.22.0/bin:${PATH}"
 ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
@@ -58,14 +76,12 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 # Next.js standalone 自带运行所需的精简 node_modules
-COPY --chown=dev:dev --from=builder /app/.next/standalone ./
-COPY --chown=dev:dev --from=builder /app/.next/static ./.next/static
-COPY --chown=dev:dev --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
 
 # 数据目录(SQLite / .codepilot),供 volume 挂载
 RUN mkdir -p /app/data
 
 EXPOSE 3000
-# 清空基础镜像的 /bin/zsh entrypoint
-ENTRYPOINT []
 CMD ["node", "server.js"]

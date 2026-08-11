@@ -36,24 +36,33 @@ scripts/release-docker.sh v0.66.0-docker
 ### 手动构建运行
 
 ```bash
+# 构建期下载 external 资源需要代理
 export https_proxy=http://172.24.0.5:3128 http_proxy=http://172.24.0.5:3128
 
-# 构建
-docker build -t codepilot-web:latest \
-  --build-arg HTTP_PROXY_URL=http://172.24.0.5:3128 \
-  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
-  .
+# 1. 构建镜像
+#    - HTTP_PROXY_URL: 下载 better-sqlite3 预编译二进制等外部资源用
+#    - NPM_REGISTRY: npm 源，默认 npmmirror; 内网环境可替换为 nexus
+#    - 构建耗时较长(缓存表明，打包+下载 30 min+)，建议后台运行方便查看进度
+# 示例：仅前台执行
+# docker build -t codepilot-web:latest .
+docker build \
+    --build-arg NPM_REGISTRY=https://nexus.jereh.cn/repository/npm-public/ \
+    --build-arg HTTP_PROXY_URL=http://172.24.0.5:3128 \
+    -t codepilot-web:latest .
 
-# 数据目录须归属容器内 dev 用户(uid 1001),否则 SQLite 无法建库
+# 2. 准备数据目录
+#    容器内运行时用户为 dev (uid 1001)，宿主机目录也必须属主 1001，否则 SQLite 无法建库
 mkdir -p ~/.codepilot-web/data
 sudo chown -R 1001:1001 ~/.codepilot-web/data
 
-# 运行
+# 3. 运行容器
+#    -p 3000:3000    : 宿主机 3000 端口映射到容器内 3000 端口(Next.js standalone 固定监听 3000)
+#    -v <host>:/app/data : 把 SQLite 数据库持久化到宿主机，容器重建数据不丢失
 docker run -d \
-  --name codepilot-web \
-  -p 3000:3000 \
-  -v ~/.codepilot-web/data:/app/data \
-  codepilot-web:latest
+    --name codepilot-web \
+    -p 3000:3000 \
+    -v ~/.codepilot-web/data:/app/data \
+    codepilot-web:latest
 ```
 
 ## release-docker.sh 用法
