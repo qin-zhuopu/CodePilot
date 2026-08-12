@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SSEEvent, TokenUsage } from '@/types';
 
 export interface SSEStreamCallbacks {
@@ -35,6 +35,16 @@ export function useSSEStream(callbacks: SSEStreamCallbacks): UseSSEStreamReturn 
       abortRef.current = null;
     }
     setIsStreaming(false);
+  }, []);
+
+  // Abort any in-flight stream when the consuming component unmounts
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
+      }
+    };
   }, []);
 
   const start = useCallback((url: string, body: Record<string, unknown>) => {
@@ -89,10 +99,10 @@ export function useSSEStream(callbacks: SSEStreamCallbacks): UseSSEStreamReturn 
             } else if (line.startsWith('data: ')) {
               const dataStr = line.slice(6);
               try {
-                const data = JSON.parse(dataStr) as Record<string, unknown>;
+                const data = JSON.parse(dataStr);
                 dispatchEvent(currentEvent, data, callbacksRef.current);
               } catch {
-                // If data line is not JSON, try as plain text for text_delta
+                // If data line isn't JSON, try the whole line as a plain text event
                 if (currentEvent === 'text_delta') {
                   callbacksRef.current.onText?.(dataStr);
                 }
@@ -188,6 +198,8 @@ function toSSEEvent(
     case 'error':
       return { type: 'error', message: String(data.message ?? 'Unknown error') };
     default:
+      // Log unrecognized event types so protocol changes are visible during development
+      console.debug(`[useSSEStream] Unknown event type: "${eventType}"`, data);
       return null;
   }
 }

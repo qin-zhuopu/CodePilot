@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { MessageList } from '@/components/chat/MessageList';
 import { MessageInput } from '@/components/chat/MessageInput';
-import { useSSEStream } from '@/hooks/useSSEStream';
-import type { ChatSession, Message, TokenUsage } from '@/types';
+import { useChatSession } from '@/hooks/useChatSession';
+import type { ChatSession } from '@/types';
 
 /**
  * ChatSessionPage - Existing session page (route: /chat/:id)
@@ -12,10 +12,10 @@ import type { ChatSession, Message, TokenUsage } from '@/types';
 export function ChatSessionPage() {
   const { id } = useParams<{ id: string }>();
   const [session, setSession] = useState<ChatSession | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [streamingContent, setStreamingContent] = useState('');
   const [loading, setLoading] = useState(true);
-  const streamingRef = useRef('');
+
+  const { messages, setMessages, streamingContent, isStreaming, sendMessage, stop } =
+    useChatSession();
 
   // Fetch session info and messages
   useEffect(() => {
@@ -51,71 +51,17 @@ export function ChatSessionPage() {
     }
 
     loadSession();
-    return () => { cancelled = true; };
-  }, [id]);
-
-  const { start, stop, isStreaming } = useSSEStream({
-    onStart: () => {
-      streamingRef.current = '';
-      setStreamingContent('');
-    },
-    onText: (content) => {
-      streamingRef.current += content;
-      setStreamingContent(streamingRef.current);
-    },
-    onResult: (usage: TokenUsage) => {
-      // Streaming complete - add the assistant message
-      const finalContent = streamingRef.current;
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: finalContent,
-          created_at: new Date().toISOString(),
-          token_usage: usage,
-        },
-      ]);
-      streamingRef.current = '';
-      setStreamingContent('');
-    },
-    onError: (message) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `error-${Date.now()}`,
-          role: 'assistant',
-          content: `Error: ${message}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-      streamingRef.current = '';
-      setStreamingContent('');
-    },
-  });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, setMessages]);
 
   const handleSend = useCallback(
     (content: string) => {
       if (!id) return;
-
-      // Add optimistic user message
-      const userMessage: Message = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        content,
-        created_at: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev, userMessage]);
-
-      // Start SSE stream
-      start('/api/chat/messages', {
-        sessionId: id,
-        content,
-        model: session?.model || 'claude-sonnet-4-20250514',
-        providerId: 'default',
-      });
+      sendMessage(content, id, session?.model);
     },
-    [id, session?.model, start],
+    [id, session?.model, sendMessage],
   );
 
   if (loading) {

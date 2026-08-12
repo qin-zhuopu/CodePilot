@@ -1,10 +1,9 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageList } from '@/components/chat/MessageList';
 import { MessageInput } from '@/components/chat/MessageInput';
-import { useSSEStream } from '@/hooks/useSSEStream';
+import { useChatSession } from '@/hooks/useChatSession';
 import { useTranslation } from '@/hooks/useTranslation';
-import type { Message } from '@/types';
 
 /**
  * ChatPage - New chat page (route: /chat)
@@ -14,72 +13,27 @@ import type { Message } from '@/types';
 export function ChatPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [streamingContent, setStreamingContent] = useState('');
-  const sessionIdRef = useRef<string | null>(null);
-  const streamingRef = useRef('');
 
-  const { start, stop, isStreaming } = useSSEStream({
-    onStart: () => {
-      streamingRef.current = '';
-      setStreamingContent('');
-    },
-    onText: (content) => {
-      streamingRef.current += content;
-      setStreamingContent(streamingRef.current);
-    },
-    onResult: () => {
-      // Streaming complete - add the assistant message
-      const finalContent = streamingRef.current;
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: finalContent,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-      streamingRef.current = '';
-      setStreamingContent('');
-      // Navigate to the session page
-      if (sessionIdRef.current) {
-        navigate(`/chat/${sessionIdRef.current}`, { replace: true });
-      }
-    },
-    onError: (message) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `error-${Date.now()}`,
-          role: 'assistant',
-          content: `Error: ${message}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-      streamingRef.current = '';
-      setStreamingContent('');
-    },
-  });
+  const { messages, setMessages, streamingContent, isStreaming, sendMessage, stop } =
+    useChatSession({
+      onStreamComplete: (sessionId) => {
+        if (sessionId) {
+          navigate(`/chat/${sessionId}`, { replace: true });
+        }
+      },
+    });
 
   const handleSend = useCallback(
     async (content: string) => {
-      // Add user message
-      const userMessage: Message = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        content,
-        created_at: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev, userMessage]);
-
       try {
-        // Create a new session
+        // Create a new session without sending the message content for processing.
+        // The session creation endpoint only allocates a session ID.
+        // The actual message is sent exclusively via the SSE stream below,
+        // avoiding the duplicate-message problem of sending content in both requests.
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            content,
             model: 'claude-sonnet-4-20250514',
             providerId: 'default',
             workingDirectory: '',
@@ -92,15 +46,9 @@ export function ChatPage() {
         }
 
         const session = await response.json();
-        sessionIdRef.current = session.id;
 
-        // Start SSE stream for messages
-        start('/api/chat/messages', {
-          sessionId: session.id,
-          content,
-          model: 'claude-sonnet-4-20250514',
-          providerId: 'default',
-        });
+        // Send the message via SSE stream (single path for message processing)
+        sendMessage(content, session.id);
       } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : 'Failed to send message';
         setMessages((prev) => [
@@ -114,7 +62,7 @@ export function ChatPage() {
         ]);
       }
     },
-    [start],
+    [sendMessage, setMessages],
   );
 
   const showWelcome = messages.length === 0 && !isStreaming;
