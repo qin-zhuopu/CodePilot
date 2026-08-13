@@ -1,13 +1,14 @@
-import { Controller, Get, Post, Param, Body, Res } from '@nestjs/common';
-import { Response } from 'express';
+import { Controller, Get, Post, Param, Body, Req, Res } from '@nestjs/common';
+import { Request, Response } from 'express';
 import { mockSessions, mockMessages, ChatSession, Message } from './mock-data';
 
 @Controller('api/chat')
 export class MockChatController {
+  // Note: In-memory state is shared across all requests (singleton controller).
+  // This is acceptable for a single-developer mock service but means multiple
+  // browser tabs or concurrent test clients share mutation side-effects.
   private sessions: ChatSession[] = [...mockSessions];
-  private messages: Record<string, Message[]> = JSON.parse(
-    JSON.stringify(mockMessages),
-  );
+  private messages: Record<string, Message[]> = { ...mockMessages };
 
   @Get('sessions')
   getSessions() {
@@ -48,9 +49,16 @@ export class MockChatController {
   @Post('messages')
   async sendMessage(
     @Body() body: { session_id: string; content: string },
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     const { session_id, content } = body;
+
+    // Track client disconnect to abort the stream early
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+    });
 
     // Store user message
     const userMessage: Message = {
@@ -77,14 +85,14 @@ export class MockChatController {
     const chunks = this.splitIntoChunks(mockReply, 3);
 
     // Send status event
-    res.write(
-      `event: status\ndata: ${JSON.stringify({ text: 'Thinking...' })}\n\n`,
-    );
+    if (clientDisconnected) { res.end(); return; }
+    res.write(`event: status\ndata: ${JSON.stringify({ text: 'Thinking...' })}\n\n`);
 
     // Stream text_delta events
     let totalOutputTokens = 0;
     for (let i = 0; i < chunks.length; i++) {
       await this.delay(100 + Math.random() * 200);
+      if (clientDisconnected) { res.end(); return; }
       const chunk = chunks[i];
       totalOutputTokens += chunk.split(' ').length;
       res.write(
@@ -107,6 +115,7 @@ export class MockChatController {
     this.messages[session_id].push(assistantMessage);
 
     // Send result event
+    if (clientDisconnected) { res.end(); return; }
     res.write(
       `event: result\ndata: ${JSON.stringify({
         usage: {
