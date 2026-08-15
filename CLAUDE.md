@@ -90,6 +90,12 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
   ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/" npm install
   ```
   （Windows Git Bash 语法；PowerShell 用 `$env:ELECTRON_MIRROR="..."`。）
+- **better-sqlite3 预编译二进制同理**：默认从 GitHub Releases 下载（不走 npm registry），直连极慢；prebuild-install 支持 npmmirror 二进制镜像（2026-08-15 实测可用，1MB / 0.6s）：
+  ```bash
+  npm_config_better_sqlite3_binary_host_mirror="https://registry.npmmirror.com/-/binary/better-sqlite3"
+  ```
+  与 `ELECTRON_MIRROR` 一起设置后再 `npm install`。镜像路径规则为 `{host}/v{版本}/better-sqlite3-v{版本}-{node|electron}-v{ABI}-{平台}-{架构}.tar.gz`，Electron ABI 的 prebuild 同样有镜像。
+- 不设镜像且本地缓存（`~/.npm/_prebuilds`）没有对应 tarball 时，会回退 node-gyp 源码编译，需要 VS Build Tools + Python，否则安装失败。
 - 若安装被中断（如 `node_modules/.bin` 整个缺失、`next` 命令找不到），直接重新执行上述安装命令即可修复。
 - 若 `.npmrc` 未配置镜像且经常遇到该问题，可在项目 `.npmrc` 中加 `electron_mirror=https://npmmirror.com/mirrors/electron/`。
 
