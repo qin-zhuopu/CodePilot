@@ -16,7 +16,7 @@
 #   --port <port>      宿主机映射端口(默认 3000)
 #   --name <name>      容器名(默认 codepilot-web)
 #   --data <dir>       宿主机数据目录(默认 ~/.codepilot-web/data),挂载到 /app/data
-#   --http-proxy <url> 构建期代理(默认 http://172.24.0.5:3128),供 better-sqlite3 预编译下载
+#   --sqlite3-prebuild-host <url> better-sqlite3 预编译二进制镜像(默认 npmmirror)
 #   --npm-registry <url> npm registry(默认 https://registry.npmmirror.com)
 #   --no-run           只构建镜像,不启动容器
 #   --keep-worktree    保留临时 worktree(调试用)
@@ -32,7 +32,7 @@ set -euo pipefail
 PORT=3000
 NAME=codepilot-web
 DATA_DIR="${HOME}/.codepilot-web/data"
-HTTP_PROXY_URL=http://172.24.0.5:3128
+SQLITE3_PREBUILD_HOST=https://registry.npmmirror.com/-/binary/better-sqlite3
 NPM_REGISTRY=https://registry.npmmirror.com
 DO_RUN=1
 KEEP_WORKTREE=0
@@ -59,7 +59,8 @@ while [ $# -gt 0 ]; do
     --port)         PORT="${2:?--port 需要值}"; shift 2 ;;
     --name)         NAME="${2:?--name 需要值}"; shift 2 ;;
     --data)         DATA_DIR="${2:?--data 需要值}"; shift 2 ;;
-    --http-proxy)   HTTP_PROXY_URL="${2:?--http-proxy 需要值}"; shift 2 ;;
+    --http-proxy)   die "--http-proxy 已移除:better-sqlite3 预编译默认走 npmmirror 镜像,无需代理" ;;
+    --sqlite3-prebuild-host) SQLITE3_PREBUILD_HOST="${2:?--sqlite3-prebuild-host 需要值}"; shift 2 ;;
     --npm-registry) NPM_REGISTRY="${2:?--npm-registry 需要值}"; shift 2 ;;
     --no-run)       DO_RUN=0; shift ;;
     --keep-worktree) KEEP_WORKTREE=1; shift ;;
@@ -113,7 +114,7 @@ info "开始构建镜像(容器内 npm install + npm run build,可能需要 10-2
 docker build \
   -t "$IMAGE" \
   -t "${NAME}:latest" \
-  --build-arg "HTTP_PROXY_URL=${HTTP_PROXY_URL}" \
+  --build-arg "SQLITE3_PREBUILD_HOST=${SQLITE3_PREBUILD_HOST}" \
   --build-arg "NPM_REGISTRY=${NPM_REGISTRY}" \
   "$WORKTREE_DIR" \
   || die "docker build 失败"
@@ -158,8 +159,8 @@ info "等待服务就绪(健康检查 /api/health)..."
 HEALTH_URL="http://localhost:${PORT}/api/health"
 OK=0
 for i in $(seq 1 30); do
-  # --noproxy '*' 必须:调用者环境常设 http_proxy/https_proxy(供构建期
-  # 走代理下载),若不绕过,curl 会把本地 localhost 请求也发给代理,导致
+  # --noproxy '*' 必须:若调用者 shell 设有 http_proxy/https_proxy,
+  # 不绕过的话 curl 会把本地 localhost 请求也发给代理,导致
   # 健康检查恒返回 503/000。
   code="$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)"
   if [ "$code" = "200" ]; then OK=1; break; fi

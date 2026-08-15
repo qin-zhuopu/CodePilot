@@ -16,16 +16,13 @@ CodePilot 桌面端 = Electron 外壳 + Next.js 服务。Web 服务本身(Next.j
 ### 前置条件
 - 已安装 Docker(支持多阶段构建 / BuildKit)
 - 能访问基础镜像 `harbor.jereh.cn/base/ubuntu:24.04-node22-python312`
-- 构建期需要 HTTP 代理(下载 npm 包 + better-sqlite3 预编译二进制)
+- npm 包走 npmmirror / 内网 nexus;better-sqlite3 预编译二进制走 npmmirror 二进制镜像(无需代理)
 
 ### 一键发布(推荐)
 
 用参数化脚本从指定 git tag 构建并部署:
 
 ```bash
-# 构建期依赖走代理(better-sqlite3 预编译二进制从 GitHub 下载)
-export https_proxy=http://172.24.0.5:3128 http_proxy=http://172.24.0.5:3128
-
 scripts/release-docker.sh v0.66.0-docker
 ```
 
@@ -36,18 +33,15 @@ scripts/release-docker.sh v0.66.0-docker
 ### 手动构建运行
 
 ```bash
-# 构建期下载 external 资源需要代理
-export https_proxy=http://172.24.0.5:3128 http_proxy=http://172.24.0.5:3128
-
 # 1. 构建镜像
-#    - HTTP_PROXY_URL: 下载 better-sqlite3 预编译二进制等外部资源用
 #    - NPM_REGISTRY: npm 源，默认 npmmirror; 内网环境可替换为 nexus
+#    - SQLITE3_PREBUILD_HOST: better-sqlite3 预编译二进制镜像,
+#      默认 https://registry.npmmirror.com/-/binary/better-sqlite3 (无需代理)
 #    - 构建耗时较长(缓存表明，打包+下载 30 min+)，建议后台运行方便查看进度
 # 示例：仅前台执行
 # docker build -t codepilot-web:latest .
 docker build \
     --build-arg NPM_REGISTRY=https://nexus.jereh.cn/repository/npm-public/ \
-    --build-arg HTTP_PROXY_URL=http://172.24.0.5:3128 \
     -t codepilot-web:latest .
 
 # 2. 准备数据目录
@@ -77,7 +71,8 @@ scripts/release-docker.sh <tag> [options]
 | `--port <port>` | 宿主机映射端口 | `3000` |
 | `--name <name>` | 容器名 | `codepilot-web` |
 | `--data <dir>` | 宿主机数据目录(挂载到 `/app/data`) | `~/.codepilot-web/data` |
-| `--http-proxy <url>` | 构建期代理 | `http://172.24.0.5:3128` |
+| `--http-proxy <url>` | **已移除**。better-sqlite3 预编译默认走 npmmirror 镜像,无需代理 | — |
+| `--sqlite3-prebuild-host <url>` | better-sqlite3 预编译二进制镜像 | `https://registry.npmmirror.com/-/binary/better-sqlite3` |
 | `--npm-registry <url>` | npm registry | `https://registry.npmmirror.com` |
 | `--no-run` | 只构建镜像,不启动容器 | — |
 | `--keep-worktree` | 保留临时 worktree(调试用) | — |
@@ -99,8 +94,8 @@ scripts/release-docker.sh v0.66.0-docker --no-run
 
 ```
 builder 阶段(基础镜像)
-  ├─ npm install(容器内,npmmirror registry)
-  │    ├─ better-sqlite3 预编译二进制走代理从 GitHub 下载
+  ├─ npm install(容器内,npmmirror registry,--ignore-scripts)
+  │    ├─ better-sqlite3 预编译二进制从 npmmirror 镜像 curl 下载(SQLITE3_PREBUILD_HOST)
   │    └─ ELECTRON_SKIP_BINARY_DOWNLOAD=1(web 部署不需要 electron 二进制)
   └─ npm run build → 产出 .next/standalone
 
@@ -165,13 +160,13 @@ builder 阶段若设 `NODE_ENV=development`,会让 `next build` 时 React 加载
 - **处理:** builder 阶段不设 `NODE_ENV`。`npm install` 默认就装 devDependencies,不需要它。
 
 ### 附:代理污染本地健康检查
-调用脚本时 shell 常设 `http_proxy`/`https_proxy`(供构建期下载),curl 健康检查会把本地 `localhost` 请求也发给代理,返回 503。
+若调用脚本的 shell 设有 `http_proxy`/`https_proxy`,curl 健康检查会把本地 `localhost` 请求也发给代理,返回 503。
 - **处理:** 脚本健康检查 curl 加 `--noproxy '*'`。
 
 ## 依赖网络说明
 
 - **npm 包:** 走 `registry.npmmirror.com`(内网 `nexus.jereh.cn` 实测频繁超时,已弃用)。
-- **better-sqlite3 二进制:** `prebuild-install` 从 GitHub 下载预编译包,需代理。Node 22 = ABI 127,linux-x64/glibc,与基础镜像匹配,一般直接命中预编译包不触发本地编译。若下载失败,镜像自带 `g++`/`make`/`python3` 可兜底 `node-gyp` 编译。
+- **better-sqlite3 二进制:** Dockerfile 用 `--ignore-scripts` 跳过 postinstall,再从 npmmirror 二进制镜像(`SQLITE3_PREBUILD_HOST`,默认 `https://registry.npmmirror.com/-/binary/better-sqlite3`)curl 下载预编译包(2026-08-15 实测可用,无需代理;GitHub Releases 直连内网不可达)。Node 22 = ABI 127,linux-x64/glibc,与基础镜像匹配。URL 路径规则:`{host}/v{版本}/better-sqlite3-v{版本}-node-v127-linux-x64.tar.gz`,版本号升级时需同步改 Dockerfile。若下载失败,镜像自带 `g++`/`make`/`python3` 可兜底 `node-gyp` 编译。
 - **electron 二进制:** `ELECTRON_SKIP_BINARY_DOWNLOAD=1` 跳过(web 部署用不到,否则会卡在 GitHub 下载)。
 
 ## 常用运维命令

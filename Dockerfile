@@ -4,8 +4,8 @@
 # 基础镜像: harbor.jereh.cn/base/node:22(内部 Node.js 22 镜像)
 #
 # 构建参数(可用 --build-arg 覆盖):
-#   NPM_REGISTRY     —— npm registry(默认内网 nexus,可传入其他地址覆盖)
-#   HTTP_PROXY_URL   —— better-sqlite3 预编译二进制走 GitHub 下载所需代理
+#   NPM_REGISTRY          —— npm registry(默认内网 nexus,可传入其他地址覆盖)
+#   SQLITE3_PREBUILD_HOST —— better-sqlite3 预编译二进制镜像(默认 npmmirror)
 
 ARG BASE_IMAGE=harbor.jereh.cn/base/node:22
 
@@ -16,8 +16,8 @@ FROM ${BASE_IMAGE} AS builder
 
 # 构建参数仅作为默认值 / fallback(未传 secret 时使用)。
 # 值本身不出现在镜像层中,只有被 secret mount 读取过才会留痕迹。
-ARG HTTP_PROXY_URL=http://172.24.0.5:3128
 ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG SQLITE3_PREBUILD_HOST=https://registry.npmmirror.com/-/binary/better-sqlite3
 
 ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY} \
     ELECTRON_SKIP_BINARY_DOWNLOAD=1
@@ -43,19 +43,13 @@ RUN --mount=type=secret,id=npm_registry,dst=/run/secrets/npm_registry \
       --registry=${NPM_REGISTRY:-$NPM_CONFIG_REGISTRY}
 
 # 2) 预下载 better-sqlite3 预编译二进制并解压到位。
-#    curl 走代理(从 secret 读取 HTTP_PROXY_URL)。
-#    未传 secret 则走 ARG 默认值。
-RUN --mount=type=secret,id=http_proxy,dst=/run/secrets/http_proxy \
-    HTTP_PROXY_URL=$(\
-      [ -f /run/secrets/http_proxy ] \
-      && cat /run/secrets/http_proxy \
-      || echo "${HTTP_PROXY_URL}" \
-    ) && \
-    mkdir -p node_modules/better-sqlite3/build/Release && \
-    HTTP_PROXY=${HTTP_PROXY_URL} HTTPS_PROXY=${HTTP_PROXY_URL} \
+#    默认走 npmmirror 二进制镜像(GitHub Releases 直连在内网不可达),
+#    可通过 --build-arg SQLITE3_PREBUILD_HOST 覆盖。
+#    版本需与 package.json 中 better-sqlite3 版本保持一致。
+RUN mkdir -p node_modules/better-sqlite3/build/Release && \
     curl -fSL --connect-timeout 30 --max-time 300 \
       -o /tmp/better-sqlite3-prebuild.tar.gz \
-      https://github.com/WiseLibs/better-sqlite3/releases/download/v12.6.2/better-sqlite3-v12.6.2-node-v127-linux-x64.tar.gz && \
+      ${SQLITE3_PREBUILD_HOST}/v12.6.2/better-sqlite3-v12.6.2-node-v127-linux-x64.tar.gz && \
     tar xzf /tmp/better-sqlite3-prebuild.tar.gz -C /tmp && \
     mv /tmp/build/Release/better_sqlite3.node node_modules/better-sqlite3/build/Release/
 
