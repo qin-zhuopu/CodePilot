@@ -1,7 +1,7 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
-/node_modules
+node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -61,10 +61,9 @@ src/__tests__/e2e/*-snapshots/
 # local runtime artifacts
 .codepilot/
 
-# monorepo: site app build artifacts
-apps/site/.next/
-apps/site/.source/
-apps/site/node_modules/
+# monorepo: frontend app build artifacts
+apps/frontend/.next/
+apps/frontend/.source/
 
 # claude code session data
 .claude/
