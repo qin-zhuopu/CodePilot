@@ -82,6 +82,23 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
 
 若上述问题无法回答，先写执行计划或技术债，不要把字段接进 UI。
 
+## 安装与启动
+
+**安装依赖：**
+- 内网 / 国内网络环境下 Electron 二进制直连 GitHub 会下载失败（`node install.js` → `fetch failed`），安装时需指定镜像：
+  ```bash
+  ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/" npm install
+  ```
+  （Windows Git Bash 语法；PowerShell 用 `$env:ELECTRON_MIRROR="..."`。）
+- 若安装被中断（如 `node_modules/.bin` 整个缺失、`next` 命令找不到），直接重新执行上述安装命令即可修复。
+- 若 `.npmrc` 未配置镜像且经常遇到该问题，可在项目 `.npmrc` 中加 `electron_mirror=https://npmmirror.com/mirrors/electron/`。
+
+**常用启动命令：**
+- `npm run dev` — 开发模式（Next.js dev server）
+- `npm run electron:dev` — Electron 开发模式
+- `npm run build` — 生产构建（有 prebuild 安全检查，防止与活跃 dev 锁冲突）
+- `npm run start` — 启动生产 server（默认 http://localhost:3000）。注意：项目配置了 `output: standalone`，`next start` 有兼容性警告；纯 standalone 部署应使用 `node .next/standalone/server.js`，Electron 打包不受影响。
+
 ## 自检命令
 
 **自检命令：**
