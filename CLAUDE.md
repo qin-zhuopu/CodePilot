@@ -35,6 +35,12 @@ CodePilot — 多模型 AI Agent 桌面客户端，基于 Electron + Next.js。
 - chrome-devtools/CDP 仅作为深度诊断备用：Network/Performance/Issues、精确 CDP 能力或响应式 device emulation；如果出现 profile lock、stale process、超时或内存异常苗头，立即停止并改用更安全的验证方式
 - 涉及交互的改动（按钮、表单、导航）优先补 smoke/e2e；需要人工视觉确认时再补 Browser Use 截图
 
+**有头模式 Chrome 自动化（已启用，2026-08-15 验证）：**
+- 本项目 `.mcp.json` 中的 `chrome-devtools` server 使用**有头模式**：`--browserUrl http://127.0.0.1:29222`（不再是 `--headless`）。这样 Claude Code 通过 CDP 控制的是**用户桌面上有窗口的真实 Chrome**，用户可同屏看到自动化过程。
+- **启动 Chrome** 用 `jc chrome start -p 29222`（`jc` 是 `@jereh/jereh-cli` 的 CLI，`chrome start` 会以有头方式、带 CDP 调试端口拉起 Chrome，窗口弹在桌面）。端口固定 `29222`，勿与开发端口混淆。
+- **故障行为（已实测）**：若未先启动 Chrome（29222 端口空着），MCP server 进程**不会崩溃、不会退出**，Claude Code 会话能正常启动；只有真正调用浏览器工具（`list_pages` / `navigate_page` / `click` 等）时才返回错误：`Could not connect to Chrome. Check if Chrome is running.\nCause: Failed to fetch browser webSocket URL from http://127.0.0.1:29222/json/version: fetch failed`（`isError:true`）。
+- **恢复流程（已实测，无需重启会话）**：遇到上述 `Could not connect to Chrome` 报错时，直接执行 `jc chrome start -p 29222` 拉起有头 Chrome，然后**重试同一个浏览器工具调用即可**——`--browserUrl` 模式是每次调用时才去 fetch websocket URL，Chrome 就绪后自动连上，不需要重启 Claude Code。若 `jc chrome start` 报端口已被占用，先确认是否已有 Chrome 进程在跑或换端口后同步改 `.mcp.json`。
+
 **新增功能前必须详尽调研：**
 - 新增功能前必须充分调研相关技术方案、API 兼容性、社区最佳实践
 - 涉及 Electron API 需确认目标版本支持情况

@@ -6,7 +6,7 @@
       "args": [
         "-y",
         "chrome-devtools-mcp@0.20.3",
-        "--headless"
+        "--browserUrl", "http://127.0.0.1:29222"
       ],
       "env": {}
     }
