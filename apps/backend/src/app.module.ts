@@ -1,17 +1,11 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ProxyMiddleware } from './proxy.middleware';
+import { ProbeModule } from './probe/probe.module';
+import { MockChatModule } from './mock/mock-chat.module';
 
-/**
- * Root application module for the API gateway.
- *
- * Production deployment notes:
- * - Add @nestjs/serve-static (ServeStaticModule) to serve the built Vite assets
- *   from apps/web/dist, so the gateway becomes the single entry point for both
- *   static files and API routes.
- * - Alternatively, place a reverse proxy (nginx/caddy) in front that routes
- *   /api/* to this gateway and serves static assets directly.
- */
-@Module({})
+@Module({
+  imports: [ProbeModule, MockChatModule],
+})
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(ProxyMiddleware).forRoutes('api');
