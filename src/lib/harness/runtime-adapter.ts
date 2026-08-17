@@ -97,6 +97,8 @@ export interface RuntimeAdapterInput {
    *  threaded into the compiler input for diagnostics. */
   readonly userPrompt: string;
   readonly enabledCapabilities: ReadonlySet<string>;
+  /** Runtime-mounted tool surface for request-scoped/auth-gated filtering. */
+  readonly availableToolNames?: ReadonlySet<string>;
   /** Optional override. Default budget matches the per-runtime call
    *  sites pre-Phase-3 (100k systemPrompt / 200k context). */
   readonly tokenBudget?: {
@@ -300,6 +302,7 @@ export function adaptForClaudeCode(
     model: input.model,
     userPrompt: input.userPrompt,
     enabledCapabilities: input.enabledCapabilities,
+    availableToolNames: input.availableToolNames,
     tokenBudget: input.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
   });
   const hints: ClaudeCodeHints | undefined = compiled.runtimeHints.claudecode_sdk;
@@ -348,6 +351,7 @@ export function adaptForNative(
     model: input.model,
     userPrompt: input.userPrompt,
     enabledCapabilities: input.enabledCapabilities,
+    availableToolNames: input.availableToolNames,
     tokenBudget: input.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
   });
   const hints: NativeHints | undefined = compiled.runtimeHints.native;
@@ -404,6 +408,7 @@ export function adaptForCodexProxy(
     model: input.model,
     userPrompt: input.userPrompt,
     enabledCapabilities: input.enabledCapabilities,
+    availableToolNames: input.availableToolNames,
     tokenBudget: input.tokenBudget ?? DEFAULT_TOKEN_BUDGET,
   });
   const hints: CodexProxyHints | undefined = compiled.runtimeHints.codex_proxy;

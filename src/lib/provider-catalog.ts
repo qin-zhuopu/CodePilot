@@ -157,6 +157,14 @@ export interface VendorPreset {
     codexResponses?: {
       baseUrl: string;
       modelIds: string[];
+      /**
+       * Per-model wire ID rewrites when the Anthropic and Responses products
+       * use different names for the same catalog entry. Keys must also appear
+       * in `modelIds`; undeclared aliases never gain the transport implicitly.
+       */
+      modelIdOverrides?: Record<string, string>;
+      /** Explicit Codex-effort aliases documented by this Responses endpoint. */
+      effortAliases?: Partial<Record<'minimal' | ProviderEffortLevel, ProviderEffortLevel>>;
       /** Whether the endpoint accepts OpenAI's optional reasoning summary field. */
       supportsReasoningSummary?: boolean;
     };
@@ -298,6 +306,11 @@ export const PresetSchema = z.object({
     codexResponses: z.object({
       baseUrl: z.string().url(),
       modelIds: z.array(z.string().min(1)).min(1),
+      modelIdOverrides: z.record(z.string(), z.string().min(1)).optional(),
+      effortAliases: z.partialRecord(
+        z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
+        z.enum(['low', 'medium', 'high', 'xhigh', 'max']),
+      ).optional(),
       supportsReasoningSummary: z.boolean().optional(),
     }).optional(),
   }).optional(),
@@ -318,7 +331,11 @@ export const PresetSchema = z.object({
   // This is allowed because it's a preset default, not user input — though the AUTH_ENV_KEYS skip in
   // toClaudeCodeEnv() means it will only take effect if the user doesn't provide their own key.
   return true;
-}, { message: 'authStyle conflicts with auth-related keys in defaultEnvOverrides' });
+}, { message: 'authStyle conflicts with auth-related keys in defaultEnvOverrides' }).refine(data => {
+  const responses = data.wireCapabilities?.codexResponses;
+  return !responses?.modelIdOverrides
+    || Object.keys(responses.modelIdOverrides).every(modelId => responses.modelIds.includes(modelId));
+}, { message: 'codexResponses.modelIdOverrides keys must be declared in modelIds' });
 
 // ── Default Anthropic models ────────────────────────────────────
 
@@ -592,53 +609,55 @@ const BEDROCK_VERTEX_DEFAULT_MODELS: CatalogModel[] = [
 ];
 
 /**
- * GLM Coding Plan catalog — shared by the CN and Global presets (identical
- * plan, different region endpoint). Phase 1 (2026-07-17).
+ * GLM Coding Plan catalog — shared by the CN and Global presets (same lineup,
+ * different regional endpoints). Verified against the vendor's GLM-5.3 model,
+ * latest-model, overview, Claude Code and Codex pages on 2026-08-14; the
+ * evidence matrix lives in
+ * docs/research/glm-5-3-codeplan-adaptation-2026-08-14.md.
  *
- * Effort: GLM's Claude Code adapter collapses the SIX `/effort` tokens onto
- * TWO real tiers — low/medium/high → high, xhigh/max/ultracode → max
- * (source: docs.bigmodel.cn/cn/guide/develop/claude, recorded in
- * docs/research/foundation-experience-refresh-2026-07-17.md). So the honest
- * menu is exactly `high` + `max`: offering five tiers would let the user pick
- * `low` and pay for `high`, which is the fake-precision this plan exists to
- * remove. `effortNoteKey` states the collapse in the menu so two tiers don't
- * read as "GLM only has two speeds".
- *
- * Model rows: GLM-5.2 is the current Coding Plan generation (superseding the
- * GLM-5-Turbo / GLM-5.1 pair this catalog used to list). Both the sonnet and
- * opus role slots map to it (see defaultEnvOverrides), so it is listed ONCE —
- * two rows both reading "GLM-5.2" would be two names for one model, i.e. the
- * same fake differentiation in the model picker.
- *
- * Not verified without a real key (tracked in the plan's Smoke Ledger):
- * whether the sonnet slot has its own distinct 5.2-generation turbo SKU, the
- * `[1m]` long-context variant, and whether haiku still resolves to
- * glm-4.5-air (left as-is — nothing in the baseline says it moved).
+ * The stable `sonnet` / `haiku` modelIds preserve saved CodePilot sessions.
+ * Their upstream IDs are the current official products. Claude's Anthropic
+ * route uses `glm-5.3[1m]`, while the native Responses route requires the bare
+ * `glm-5.3`; that transport-specific rewrite is declared in wireCapabilities
+ * rather than represented as a duplicate picker row.
  */
 const GLM_CODING_PLAN_MODELS: CatalogModel[] = [
   {
     modelId: 'sonnet',
-    // Self-referential upstream: GLM's gateway resolves the bare
-    // sonnet/opus/haiku aliases server-side, so the wire keeps sending the
-    // alias. Unchanged this round — retargeting GLM onto explicit SKU ids is
-    // a wire change no credential-less round should make.
-    upstreamModelId: 'sonnet',
-    displayName: 'GLM-5.2',
+    upstreamModelId: 'glm-5.3[1m]',
+    displayName: 'GLM-5.3',
     role: 'sonnet',
     capabilities: {
+      reasoning: true,
+      toolUse: true,
+      contextWindow: 1_048_576,
       supportsEffort: true,
-      supportedEffortLevels: ['high', 'max'],
-      effortNoteKey: 'messageInput.effort.note.glmTwoTier',
+      supportedEffortLevels: ['low', 'high', 'max'],
+      defaultEffortLevel: 'max',
+      effortNoteKey: 'messageInput.effort.note.glmCodePlan',
+    },
+  },
+  {
+    modelId: 'glm-5-turbo',
+    upstreamModelId: 'glm-5-turbo',
+    displayName: 'GLM-5-Turbo',
+    capabilities: {
+      reasoning: true,
+      toolUse: true,
+      contextWindow: 204_800,
+      defaultEffortLevel: 'max',
     },
   },
   {
     modelId: 'haiku',
-    upstreamModelId: 'haiku',
-    displayName: 'GLM-4.5-Air',
+    upstreamModelId: 'glm-4.7',
+    displayName: 'GLM-4.7',
     role: 'haiku',
-    // No effort capability declared: the baseline only attests the two-tier
-    // mapping for the coding models. Absent → the selector hides rather than
-    // guessing (see src/lib/effort-levels.ts).
+    capabilities: {
+      reasoning: true,
+      toolUse: true,
+      contextWindow: 204_800,
+    },
   },
 ];
 
@@ -710,7 +729,7 @@ export const VENDOR_PRESETS: VendorPreset[] = [
 
   // ── xAI official Responses API ──
   // Keep this branded and separate from the generic OpenAI-compatible preset:
-  // Grok 4.5's supported product path is /v1/responses via @ai-sdk/xai.
+  // Grok 4.6's supported product path is /v1/responses via @ai-sdk/xai.
   {
     key: 'xai',
     name: 'xAI API Key',
@@ -721,9 +740,23 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     baseUrl: 'https://api.x.ai/v1',
     defaultEnvOverrides: {},
     defaultModels: [
-      { modelId: 'grok-4.5', displayName: 'Grok 4.5' },
+      {
+        modelId: 'grok-4.6',
+        displayName: 'Grok 4.6',
+        capabilities: {
+          reasoning: true,
+          toolUse: true,
+          vision: true,
+          contextWindow: 500_000,
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'medium', 'high'],
+          thinkingMode: 'always',
+          defaultEffortLevel: 'high',
+        },
+      },
+      { modelId: 'grok-4.5', displayName: 'Grok 4.5 (Legacy)' },
     ],
-    defaultRoleModels: { default: 'grok-4.5' },
+    defaultRoleModels: { default: 'grok-4.6' },
     fields: ['api_key'],
     iconKey: 'xai',
     meta: {
@@ -779,16 +812,46 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     protocol: 'anthropic',
     authStyle: 'auth_token',
     baseUrl: 'https://open.bigmodel.cn/api/anthropic',
-    defaultEnvOverrides: { API_TIMEOUT_MS: '3000000', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2' },
+    defaultEnvOverrides: {
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.3[1m]',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3[1m]',
+    },
     defaultModels: GLM_CODING_PLAN_MODELS,
+    defaultRoleModels: {
+      default: 'glm-5.3[1m]',
+      sonnet: 'glm-5.3[1m]',
+      opus: 'glm-5.3[1m]',
+      haiku: 'glm-4.7',
+    },
+    wireCapabilities: {
+      anthropicEffort: { modelIds: ['glm-5.3[1m]'] },
+      codexResponses: {
+        baseUrl: 'https://open.bigmodel.cn/api/v1',
+        modelIds: ['glm-5.3[1m]', 'glm-5-turbo'],
+        modelIdOverrides: { 'glm-5.3[1m]': 'glm-5.3' },
+        effortAliases: { minimal: 'low', medium: 'high', xhigh: 'max' },
+        supportsReasoningSummary: true,
+      },
+    },
     fields: ['api_key'],
     iconKey: 'zhipu',
     sdkProxyOnly: true,
     meta: {
       apiKeyUrl: 'https://bigmodel.cn/usercenter/proj-mgmt/apikeys',
       docsUrl: 'https://docs.bigmodel.cn/cn/coding-plan/tool/claude',
+      pricingUrl: 'https://docs.bigmodel.cn/cn/coding-plan/overview',
       billingModel: 'coding_plan',
-      notes: ['高峰时段（14:00-18:00 UTC+8）消耗 3 倍积分'],
+      notes: [
+        'GLM-5.3 points: input 6.9, cached input 1.7, output 24.',
+        'Off-peak requests use 50% of the listed points; peak hours are weekdays 14:00–18:00 (UTC+8).',
+      ],
+      notesZh: [
+        'GLM-5.3 积分倍率：输入 6.9、缓存输入 1.7、输出 24。',
+        '非高峰时段按表列积分的 50% 消耗；高峰时段为工作日 14:00–18:00（UTC+8）。',
+      ],
       claudeCodeVerified: true,
     },
   },
@@ -802,16 +865,46 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     protocol: 'anthropic',
     authStyle: 'auth_token',
     baseUrl: 'https://api.z.ai/api/anthropic',
-    defaultEnvOverrides: { API_TIMEOUT_MS: '3000000', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2', ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2' },
+    defaultEnvOverrides: {
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.3[1m]',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3[1m]',
+    },
     defaultModels: GLM_CODING_PLAN_MODELS,
+    defaultRoleModels: {
+      default: 'glm-5.3[1m]',
+      sonnet: 'glm-5.3[1m]',
+      opus: 'glm-5.3[1m]',
+      haiku: 'glm-4.7',
+    },
+    wireCapabilities: {
+      anthropicEffort: { modelIds: ['glm-5.3[1m]'] },
+      codexResponses: {
+        baseUrl: 'https://api.z.ai/api/v1',
+        modelIds: ['glm-5.3[1m]', 'glm-5-turbo'],
+        modelIdOverrides: { 'glm-5.3[1m]': 'glm-5.3' },
+        effortAliases: { minimal: 'low', medium: 'high', xhigh: 'max' },
+        supportsReasoningSummary: true,
+      },
+    },
     fields: ['api_key'],
     iconKey: 'zhipu',
     sdkProxyOnly: true,
     meta: {
       apiKeyUrl: 'https://z.ai/manage-apikey/apikey-list',
       docsUrl: 'https://docs.z.ai/devpack/tool/claude',
+      pricingUrl: 'https://docs.z.ai/devpack/overview',
       billingModel: 'coding_plan',
-      notes: ['高峰时段（14:00-18:00 UTC+8）消耗 3 倍积分'],
+      notes: [
+        'GLM-5.3 points: input 6.9, cached input 1.7, output 24.',
+        'Off-peak requests use 50% of the listed points; peak hours are weekdays 14:00–18:00 (UTC+8).',
+      ],
+      notesZh: [
+        'GLM-5.3 积分倍率：输入 6.9、缓存输入 1.7、输出 24。',
+        '非高峰时段按表列积分的 50% 消耗；高峰时段为工作日 14:00–18:00（UTC+8）。',
+      ],
       claudeCodeVerified: true,
     },
   },
@@ -1429,7 +1522,7 @@ export const VENDOR_PRESETS: VendorPreset[] = [
     },
     // DeepSeek catalog — verified against
     // https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code,
-    // /codex, /guides/thinking_mode, and /updates (verified 2026-08-02).
+    // /codex, /guides/thinking_mode, and /quick_start/pricing (verified 2026-08-13).
     // The legacy aliases deepseek-chat
     // and deepseek-reasoner will be deprecated 2026-07-24 and currently
     // map to non-thinking / thinking modes of deepseek-v4-flash, so they
@@ -1448,7 +1541,7 @@ export const VENDOR_PRESETS: VendorPreset[] = [
           toolUse: true,
           contextWindow: 1_048_576,
           supportsEffort: true,
-          supportedEffortLevels: ['high', 'max'],
+          supportedEffortLevels: ['low', 'high', 'max'],
           defaultEffortLevel: 'high',
         },
       },
@@ -1460,8 +1553,9 @@ export const VENDOR_PRESETS: VendorPreset[] = [
         capabilities: {
           reasoning: true,
           toolUse: true,
+          contextWindow: 1_048_576,
           supportsEffort: true,
-          supportedEffortLevels: ['high', 'max'],
+          supportedEffortLevels: ['low', 'high', 'max'],
           defaultEffortLevel: 'high',
         },
       },
@@ -1486,7 +1580,8 @@ export const VENDOR_PRESETS: VendorPreset[] = [
       },
       codexResponses: {
         baseUrl: 'https://api.deepseek.com',
-        modelIds: ['deepseek-v4-flash'],
+        modelIds: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+        effortAliases: { xhigh: 'high' },
         supportsReasoningSummary: false,
       },
     },
@@ -2301,7 +2396,10 @@ export interface VerifiedProviderWireCapabilities {
   /** Verified native Responses endpoint for Codex Runtime. */
   codexResponses?: {
     baseUrl: string;
-    supportedEffortLevels: readonly ProviderEffortLevel[];
+    /** Exact model ID required by the native Responses endpoint. */
+    modelId: string;
+    supportedEffortLevels?: readonly ProviderEffortLevel[];
+    effortAliases?: Partial<Record<'minimal' | ProviderEffortLevel, ProviderEffortLevel>>;
     supportsReasoningSummary: boolean;
   };
 }
@@ -2328,21 +2426,32 @@ export function getVerifiedProviderWireCapabilities(
   if (!model) return {};
 
   const canonicalIds = new Set([model.modelId, model.upstreamModelId].filter(Boolean));
-  const isDeclared = (ids: readonly string[] | undefined): boolean =>
-    Boolean(ids?.some(id => canonicalIds.has(id)));
+  const declaredId = (ids: readonly string[] | undefined): string | undefined =>
+    ids?.find(id => canonicalIds.has(id));
   const supportedEffortLevels = model.capabilities?.supportsEffort
     ? model.capabilities.supportedEffortLevels
     : undefined;
+  const anthropicDeclaredId = declaredId(preset.wireCapabilities?.anthropicEffort?.modelIds);
+  const responsesDeclaredId = declaredId(preset.wireCapabilities?.codexResponses?.modelIds);
+  const responseModelId = responsesDeclaredId
+    ? preset.wireCapabilities?.codexResponses?.modelIdOverrides?.[responsesDeclaredId]
+      ?? model.upstreamModelId
+      ?? model.modelId
+    : undefined;
 
   return {
-    ...(supportedEffortLevels && isDeclared(preset.wireCapabilities?.anthropicEffort?.modelIds)
+    ...(supportedEffortLevels && anthropicDeclaredId
       ? { anthropicEffortLevels: supportedEffortLevels }
       : {}),
-    ...(supportedEffortLevels && isDeclared(preset.wireCapabilities?.codexResponses?.modelIds)
+    ...(responsesDeclaredId && responseModelId
       ? {
           codexResponses: {
             baseUrl: preset.wireCapabilities!.codexResponses!.baseUrl,
-            supportedEffortLevels,
+            modelId: responseModelId,
+            ...(supportedEffortLevels ? { supportedEffortLevels } : {}),
+            ...(preset.wireCapabilities!.codexResponses!.effortAliases
+              ? { effortAliases: preset.wireCapabilities!.codexResponses!.effortAliases }
+              : {}),
             supportsReasoningSummary:
               preset.wireCapabilities!.codexResponses!.supportsReasoningSummary === true,
           },

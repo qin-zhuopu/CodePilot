@@ -85,6 +85,8 @@ export interface AssembleToolsOptions {
   model?: string;
   /** Scene of the parent invocation. Delegation is fail-closed outside chat. */
   callScene?: ProviderCallScene;
+  /** Optional resolved Grok-video authorization state for deterministic assembly. */
+  grokVideoAvailable?: boolean;
   /** Parent session already resolved the full-access profile. Child tools may
    * inherit the unwrapped surface only when this explicit fact is present. */
   bypassPermissions?: boolean;
@@ -142,6 +144,8 @@ export function assembleTools(options: AssembleToolsOptions = {}): AssembleTools
       workspacePath: cwd,
       prompt: options.prompt,
       sessionId: options.sessionId ?? options.permissionContext?.sessionId,
+      providerId: options.providerId || options.sessionProviderId,
+      grokVideoAvailable: options.grokVideoAvailable,
       safeReadOnly: true,
     });
     const safeBuiltin = Object.fromEntries(
@@ -160,6 +164,8 @@ export function assembleTools(options: AssembleToolsOptions = {}): AssembleTools
     workspacePath: cwd,
     prompt: options.prompt,
     sessionId: options.sessionId ?? options.permissionContext?.sessionId,
+    providerId: options.providerId || options.sessionProviderId,
+    grokVideoAvailable: options.grokVideoAvailable,
   });
 
   // External MCP tools from connected servers

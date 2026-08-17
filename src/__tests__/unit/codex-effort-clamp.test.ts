@@ -26,10 +26,55 @@ import path from 'node:path';
 import {
   clampCodexEffort,
   resolveCodexEffort,
+  resolveCodexProviderEffort,
+  codexVersionSupportsProviderExtendedEffort,
   toGenericEffortLevels,
   CODEX_SUPPORTED_EFFORTS,
   CODEX_GENERIC_EXCLUDED_EFFORTS,
 } from '@/lib/codex/effort';
+
+describe('resolveCodexProviderEffort — CodePilot provider catalog + binary gate', () => {
+  const contract = { supportedLevels: ['low', 'high', 'max'], defaultLevel: 'max' };
+
+  it('preserves explicit Max and resolves Auto to the vendor default', () => {
+    const vocabulary = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+    assert.equal(resolveCodexProviderEffort('max', contract, vocabulary), 'max');
+    assert.equal(resolveCodexProviderEffort(undefined, contract, vocabulary), 'max');
+  });
+
+  it('fails visibly when an old binary has not advertised Max', () => {
+    assert.throws(
+      () => resolveCodexProviderEffort('max', contract, ['minimal', 'low', 'medium', 'high']),
+      /will not silently downgrade/,
+    );
+  });
+
+  it('uses binary version evidence without requiring a Codex Account model cache', () => {
+    assert.equal(codexVersionSupportsProviderExtendedEffort('codex-cli 0.144.2'), true);
+    assert.equal(codexVersionSupportsProviderExtendedEffort('codex-cli 0.145.0-alpha.1'), true);
+    assert.equal(codexVersionSupportsProviderExtendedEffort('codex-cli 0.144.1'), false);
+    assert.equal(codexVersionSupportsProviderExtendedEffort('codex-cli 0.144.2-alpha.9'), false);
+    assert.equal(
+      codexVersionSupportsProviderExtendedEffort(
+        'Codex Desktop/0.147.0-alpha.6.5 (Mac OS 26.5.2; arm64) dumb (codex_codepilot; 0.67.0)',
+      ),
+      true,
+    );
+    assert.equal(
+      codexVersionSupportsProviderExtendedEffort(
+        'Codex Desktop/0.144.2-alpha.9 (Mac OS 26.5.2; arm64) dumb (codex_codepilot; 0.67.0)',
+      ),
+      false,
+    );
+    assert.equal(codexVersionSupportsProviderExtendedEffort('agent/9.9.9 codex-cli 0.144.2'), false);
+    assert.equal(codexVersionSupportsProviderExtendedEffort('codex-cli/9.9.9 (codex-cli 0.144.2)'), false);
+    assert.equal(resolveCodexProviderEffort('max', contract, undefined, 'codex-cli 0.144.2'), 'max');
+    assert.throws(
+      () => resolveCodexProviderEffort('max', contract, undefined, 'codex-cli 0.144.1'),
+      /a Codex Account login is not required/,
+    );
+  });
+});
 
 // ── per-model allowlist (the Phase 0 rule) ───────────────────────────
 
@@ -162,11 +207,11 @@ describe('CodexRuntime turn/start — effort wiring pin (per-model allowlist)', 
     'utf8',
   );
 
-  it('imports resolveCodexEffort from ./effort', () => {
+  it('imports both account and provider effort resolvers from ./effort', () => {
     assert.match(
       runtimeSrc,
-      /import\s*\{\s*resolveCodexEffort\s*\}\s*from\s*['"]\.\/effort['"]/,
-      'runtime.ts must import resolveCodexEffort from ./effort',
+      /import\s*\{[^}]*resolveCodexEffort[^}]*resolveCodexProviderEffort[^}]*\}\s*from\s*['"]\.\/effort['"]/,
+      'runtime.ts must import both effort resolvers from ./effort',
     );
   });
 
@@ -178,12 +223,16 @@ describe('CodexRuntime turn/start — effort wiring pin (per-model allowlist)', 
     );
   });
 
-  it('computes codexEffort = resolveCodexEffort(options.effort, declaredEfforts)', () => {
+  it('resolves Codex Account per-model and CodePilot Providers from their own catalog contract', () => {
     assert.match(
       runtimeSrc,
-      /const\s+codexEffort\s*=\s*resolveCodexEffort\(\s*options\.effort\s*,\s*declaredEfforts\s*\)/,
+      /codexEffort\s*=\s*resolveCodexEffort\(\s*options\.effort\s*,\s*declaredEfforts\s*\)/,
       'runtime.ts must resolve options.effort against the per-model allowlist',
     );
+    assert.match(runtimeSrc, /getResolvedModelEffortContract\(resolvedProvider,\s*options\.model\)/);
+    assert.match(runtimeSrc, /resolveCodexProviderEffort\(/);
+    assert.match(runtimeSrc, /getCachedCodexEffortVocabulary\(\)/);
+    assert.match(runtimeSrc, /getCodexAvailability\(\)/);
   });
 
   it('turn/start payload sends the resolved codexEffort', () => {

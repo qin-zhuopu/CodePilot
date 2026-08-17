@@ -28,6 +28,8 @@
  * Schema drift + 5.6 tiers: docs/research/foundation-experience-refresh-2026-07-17.md
  */
 
+import { codexReleaseAtLeast } from './release-version';
+
 /**
  * Reasoning-effort levels assumed safe when the current model's real
  * capability list is UNKNOWN. Deliberately the old conservative set — this
@@ -78,6 +80,54 @@ export function resolveCodexEffort(
     return declaredLevels.includes(effort) ? effort : undefined;
   }
   return clampCodexEffort(effort);
+}
+
+export interface CodexProviderEffortContract {
+  supportedLevels?: readonly string[];
+  defaultLevel?: string;
+}
+
+/**
+ * First locally verified app-server whose turn/start enum accepts both
+ * xhigh and max. This is binary-schema evidence, not a Codex Account/model
+ * entitlement requirement. Newer core versions are accepted conservatively.
+ */
+export const CODEX_PROVIDER_EXTENDED_EFFORT_MIN_VERSION = '0.144.2';
+
+export function codexVersionSupportsProviderExtendedEffort(
+  version: string | undefined,
+): boolean {
+  return codexReleaseAtLeast(version, CODEX_PROVIDER_EXTENDED_EFFORT_MIN_VERSION);
+}
+
+/**
+ * Resolve a CodePilot Provider effort for Codex `turn/start`.
+ *
+ * Provider models do not appear in Codex Account's model/list, so their own
+ * catalog is the semantic allowlist. Extended enum values still need a second
+ * proof that the installed app-server understands the token: Codex 0.133, for
+ * example, accepted `xhigh` but warned and silently changed unknown `max` to
+ * medium. Missing proof is a user-visible error, never a quiet downgrade.
+ */
+export function resolveCodexProviderEffort(
+  requested: string | undefined | null,
+  contract: CodexProviderEffortContract,
+  appServerEffortVocabulary: readonly string[] | undefined,
+  appServerVersion?: string,
+): string | undefined {
+  const selected = requested || contract.defaultLevel;
+  if (!selected || !contract.supportedLevels?.includes(selected)) return undefined;
+
+  if (
+    (selected === 'xhigh' || selected === 'max')
+    && !appServerEffortVocabulary?.includes(selected)
+    && !codexVersionSupportsProviderExtendedEffort(appServerVersion)
+  ) {
+    throw new Error(
+      `The installed Codex app-server has not advertised support for the "${selected}" effort token. Update Codex to ${CODEX_PROVIDER_EXTENDED_EFFORT_MIN_VERSION} or newer, then retry; a Codex Account login is not required, and CodePilot will not silently downgrade this request.`,
+    );
+  }
+  return selected;
 }
 
 /**

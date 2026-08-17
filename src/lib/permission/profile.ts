@@ -78,8 +78,9 @@ const HUMAN_ONLY_TOOLS: Readonly<Record<string, HumanOnlyCategory>> = {
   // answering for them isn't "approval", it's impersonation.
   AskUserQuestion: 'interactive_question',
 
-  // Bills the user's third-party image API on every call.
+  // Bills the user's third-party media API on every call.
   codepilot_generate_image: 'billing',
+  codepilot_generate_video: 'billing',
 
   // Shell-executes / installs system packages.
   codepilot_cli_tools_install: 'high_impact',
@@ -171,6 +172,7 @@ export const CODEPILOT_MCP_TOOL_SERVERS: Readonly<Record<string, string>> = {
   // codepilot-media / codepilot-image-gen.
   codepilot_import_media: 'codepilot-media',
   codepilot_generate_image: 'codepilot-image-gen',
+  codepilot_generate_video: 'codepilot-image-gen',
   // codepilot-cli-tools — read-only list/check + shell-exec mutators.
   codepilot_cli_tools_list: 'codepilot-cli-tools',
   codepilot_cli_tools_check_updates: 'codepilot-cli-tools',

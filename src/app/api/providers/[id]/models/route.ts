@@ -7,8 +7,12 @@ import {
   deleteProviderModel,
   updateProviderModelUserFields,
   seedCatalogModelsIfEmpty,
+  mergeCatalogManagedModels,
 } from '@/lib/db';
-import { getCatalogDefaultModelsForRecord } from '@/lib/provider-catalog';
+import {
+  getCatalogDefaultModelsForRecord,
+  isCatalogOnlyPlanProviderRecord,
+} from '@/lib/provider-catalog';
 import type { ErrorResponse } from '@/types';
 
 /**
@@ -18,10 +22,11 @@ import type { ErrorResponse } from '@/types';
  * `?all=1`: all rows including hidden — used by Settings > Models page.
  *
  * Backfill: when the table is empty for this provider, seed the matched
- * preset's catalog defaults (rows tagged source='catalog'). This covers
- * providers that can't be auto-discovered — e.g. Xiaomi MiMo / MiniMax /
- * DeepSeek with `/anthropic` subpaths that return 404 on /v1/models.
- * Idempotent: re-fetching after a row exists won't reseed.
+ * preset's catalog defaults (rows tagged source='catalog'). For catalog-only
+ * plan providers, also merge current catalog metadata/new ids into pristine
+ * catalog rows. This upgrades old installations (for example GLM-5.2 → 5.3)
+ * without touching manual/user-edited rows or performing the destructive
+ * disable/prune behavior of a full catalog align.
  */
 export async function GET(
   request: NextRequest,
@@ -34,7 +39,10 @@ export async function GET(
   }
   const catalogDefaults = getCatalogDefaultModelsForRecord(provider);
   if (catalogDefaults.length > 0) {
-    seedCatalogModelsIfEmpty(id, catalogDefaults);
+    const seeded = seedCatalogModelsIfEmpty(id, catalogDefaults);
+    if (seeded === 0 && isCatalogOnlyPlanProviderRecord(provider)) {
+      mergeCatalogManagedModels(id, catalogDefaults);
+    }
   }
   const includeHidden = request.nextUrl.searchParams.get('all') === '1';
   const models = includeHidden ? getAllModelsForProvider(id) : getModelsForProvider(id);
@@ -44,15 +52,15 @@ export async function GET(
 /**
  * POST /api/providers/[id]/models
  *
- * Add a manual model. Sets:
- *   - `source='manual'`         — data origin: hand-entered, not API
- *   - `user_edited=1`           — legacy "this row is user-owned" signal
- *   - `enable_source='manual_enabled'` — Phase B intent signal
+ * Add a model. Arbitrary ids use the manual ownership contract. Exact ids
+ * from a catalog-only plan are re-materialized from the server-side catalog
+ * instead, so deleting/re-adding GLM-5.3 cannot erase its effort/context
+ * capabilities or permanently opt the row out of future catalog upgrades.
  *
- * Both `user_edited` and `enable_source='manual_enabled'` independently
- * gate the row out of refresh apply / catalog align (defense in depth);
- * setting both keeps the badge in the Models page accurate ("手动启用"
- * tone instead of the silent default "recommended").
+ * On the arbitrary-id branch, both `user_edited` and
+ * `enable_source='manual_enabled'` independently gate the row out of refresh
+ * apply / catalog align (defense in depth); setting both keeps the badge in
+ * the Models page accurate ("手动启用" rather than a catalog recommendation).
  */
 export async function POST(
   request: NextRequest,
@@ -71,17 +79,29 @@ export async function POST(
     return NextResponse.json<ErrorResponse>({ error: 'model_id is required' }, { status: 400 });
   }
 
-  upsertProviderModel({
-    provider_id: id,
-    model_id,
-    upstream_model_id: upstream_model_id || model_id,
-    display_name: display_name || model_id,
-    capabilities_json: capabilities_json || '{}',
-    sort_order: sort_order ?? 0,
-    source: 'manual',
-    user_edited: 1,
-    enable_source: 'manual_enabled',
-  });
+  const catalogDefaults = getCatalogDefaultModelsForRecord(provider);
+  const catalogModel = isCatalogOnlyPlanProviderRecord(provider)
+    ? catalogDefaults.find(model => model.modelId === model_id)
+    : undefined;
+
+  if (catalogModel) {
+    // Reuse the same ownership, de-duplication, ordering and conflict contract
+    // as Models GET. This also makes a stale dialog response safe when another
+    // process inserted the candidate before the click reached this route.
+    mergeCatalogManagedModels(id, catalogDefaults);
+  } else {
+    upsertProviderModel({
+      provider_id: id,
+      model_id,
+      upstream_model_id: upstream_model_id || model_id,
+      display_name: display_name || model_id,
+      capabilities_json: capabilities_json || '{}',
+      sort_order: sort_order ?? 0,
+      source: 'manual',
+      user_edited: 1,
+      enable_source: 'manual_enabled',
+    });
+  }
 
   const models = getAllModelsForProvider(id);
   return NextResponse.json({ models });

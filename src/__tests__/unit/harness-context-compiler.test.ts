@@ -340,16 +340,20 @@ describe('compileContext — tool descriptors', () => {
 
 describe('compileContext — runtimeHints boundary', () => {
   it('CodexProxyHints.builtinToolNames is a real Set + every entry mounts in createCodePilotBuiltinTools', async () => {
-    const out = compileContext(input({ runtimeId: 'codex_runtime' }));
-    const hints = out.runtimeHints.codex_proxy;
-    assert.ok(hints);
-    assert.ok(hints!.builtinToolNames instanceof Set);
     const { createCodePilotBuiltinTools } = await import('@/lib/codex/proxy/builtin-bridge');
     const bridge = createCodePilotBuiltinTools({
       sessionId: 'compiler-hint-test',
       targetProviderId: 'prov',
       workspacePath: '/tmp',
+      grokVideoAvailable: false,
     });
+    const out = compileContext(input({
+      runtimeId: 'codex_runtime',
+      availableToolNames: bridge.toolNames,
+    }));
+    const hints = out.runtimeHints.codex_proxy;
+    assert.ok(hints);
+    assert.ok(hints!.builtinToolNames instanceof Set);
     const mounted = new Set(Object.keys(bridge.tools));
     for (const name of hints!.builtinToolNames) {
       assert.ok(
@@ -357,6 +361,25 @@ describe('compileContext — runtimeHints boundary', () => {
         `${name} is in CodexProxyHints.builtinToolNames but bridge doesn't mount it`,
       );
     }
+    assert.equal(hints!.builtinToolNames.has('codepilot_generate_video'), false);
+  });
+
+  it('includes the Grok video hint when the same runtime source mounts it', async () => {
+    const { createCodePilotBuiltinTools } = await import('@/lib/codex/proxy/builtin-bridge');
+    const bridge = createCodePilotBuiltinTools({
+      sessionId: 'compiler-video-hint-test',
+      targetProviderId: 'prov',
+      workspacePath: '/tmp',
+      grokVideoAvailable: true,
+    });
+    const out = compileContext(input({
+      runtimeId: 'codex_runtime',
+      availableToolNames: bridge.toolNames,
+    }));
+    assert.equal(
+      out.runtimeHints.codex_proxy?.builtinToolNames.has('codepilot_generate_video'),
+      true,
+    );
   });
 
   it('runtimeHints fields contain no prose (no newline, no Markdown markers, ≤ 64 chars each string)', () => {

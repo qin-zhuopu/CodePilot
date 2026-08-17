@@ -3,8 +3,17 @@ import { createServer, type Server } from 'node:http';
 import { getSetting, setSetting } from './db';
 import { envProxyFetch } from './env-proxy-fetch';
 import {
-  XAI_OAUTH_CALLBACK_PORT,
+  XAI_GROK_BUILD_API_BASE_URL,
+  XAI_GROK_BUILD_AUTHENTICATE_RESPONSE,
+  XAI_GROK_BUILD_CLIENT_IDENTIFIER,
+  XAI_GROK_BUILD_CLIENT_MODE,
+  XAI_GROK_BUILD_CLIENT_VERSION,
+  XAI_GROK_BUILD_RESPONSES_PATH,
+  XAI_GROK_BUILD_TOKEN_HEADER,
+  XAI_OAUTH_CALLBACK_HOST,
+  XAI_OAUTH_CALLBACK_PATH,
   accessTokenIsExpiring,
+  buildXaiOAuthRedirectUri,
   exchangeXaiAuthorizationCode,
   parseJwtClaims,
   pollXaiDeviceTokens,
@@ -41,6 +50,7 @@ interface PendingBrowser {
   state: string;
   nonce: string;
   codeVerifier: string;
+  redirectUri: string;
   controller: AbortController;
   resolve: () => void;
   reject: (error: Error) => void;
@@ -166,10 +176,10 @@ export function isXaiOAuthUsable(): boolean {
   return !!bundle && (!accessTokenIsExpiring(bundle) || !!bundle.refreshToken);
 }
 
-async function refreshBundle(): Promise<XaiOAuthTokenBundle | undefined> {
+async function refreshBundle(force = false): Promise<XaiOAuthTokenBundle | undefined> {
   const current = readXaiOAuthBundle();
   if (!current) return undefined;
-  if (!accessTokenIsExpiring(current)) return current;
+  if (!force && !accessTokenIsExpiring(current)) return current;
   if (!current.refreshToken) {
     if (accessTokenIsExpiring(current, Date.now(), 0)) {
       clearXaiOAuthTokens();
@@ -205,15 +215,46 @@ export async function ensureXaiTokenFresh(): Promise<{ accessToken: string } | u
   return refreshed ? { accessToken: refreshed.accessToken } : undefined;
 }
 
-export function createXaiOAuthFetch(fetchImpl: typeof fetch = envProxyFetch): typeof fetch {
+async function refreshXaiTokenAfterUnauthorized(
+  rejectedAccessToken: string,
+): Promise<{ accessToken: string } | undefined> {
+  const current = readXaiOAuthBundle();
+  if (!current) return undefined;
+  if (current.accessToken !== rejectedAccessToken) {
+    return { accessToken: current.accessToken };
+  }
+  if (!current.refreshToken) return undefined;
+  if (!state.refreshPromise) {
+    state.refreshPromise = refreshBundle(true).finally(() => { state.refreshPromise = undefined; });
+  }
+  const refreshed = await state.refreshPromise;
+  return refreshed ? { accessToken: refreshed.accessToken } : undefined;
+}
+
+const GROK_BUILD_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+export function createXaiOAuthFetch(
+  modelId: string,
+  fetchImpl: typeof fetch = envProxyFetch,
+): typeof fetch {
+  if (!GROK_BUILD_MODEL_ID_PATTERN.test(modelId)) {
+    throw new Error('Grok Build OAuth requires a valid selected model ID.');
+  }
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const target = typeof input === 'string'
       ? new URL(input)
       : input instanceof URL
         ? input
         : new URL(input.url);
-    if (target.origin !== 'https://api.x.ai') {
-      throw new Error('xAI OAuth refused to send credentials to a non-xAI endpoint.');
+    if (
+      target.origin !== new URL(XAI_GROK_BUILD_API_BASE_URL).origin
+      || target.pathname !== XAI_GROK_BUILD_RESPONSES_PATH
+      || target.username
+      || target.password
+      || target.search
+      || target.hash
+    ) {
+      throw new Error('Grok Build OAuth refused to send credentials to a non-Grok Build endpoint.');
     }
     const credentials = await ensureXaiTokenFresh();
     if (!credentials) throw new Error('xAI OAuth credentials are unavailable. Reconnect in Settings or use xAI API Key.');
@@ -221,7 +262,83 @@ export function createXaiOAuthFetch(fetchImpl: typeof fetch = envProxyFetch): ty
     new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
     headers.delete('authorization');
     headers.set('Authorization', `Bearer ${credentials.accessToken}`);
+    headers.set('X-XAI-Token-Auth', XAI_GROK_BUILD_TOKEN_HEADER);
+    headers.set('x-authenticateresponse', XAI_GROK_BUILD_AUTHENTICATE_RESPONSE);
+    headers.set('x-grok-client-version', XAI_GROK_BUILD_CLIENT_VERSION);
+    headers.set('x-grok-client-identifier', XAI_GROK_BUILD_CLIENT_IDENTIFIER);
+    headers.set('x-grok-client-mode', XAI_GROK_BUILD_CLIENT_MODE);
+    headers.set('x-grok-model-override', modelId);
     return fetchImpl(input, { ...init, headers });
+  }) as typeof fetch;
+}
+
+const XAI_MEDIA_API_ORIGIN = 'https://api.x.ai';
+const XAI_VIDEO_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+function isAllowedXaiMediaRequest(target: URL, method: string): boolean {
+  if (
+    target.origin !== XAI_MEDIA_API_ORIGIN
+    || target.username
+    || target.password
+    || target.search
+    || target.hash
+  ) return false;
+  if (method === 'POST') {
+    return target.pathname === '/v1/images/generations'
+      || target.pathname === '/v1/images/edits'
+      || target.pathname === '/v1/videos/generations';
+  }
+  if (method !== 'GET') return false;
+  const match = /^\/v1\/videos\/([^/]+)$/.exec(target.pathname);
+  return !!match && XAI_VIDEO_REQUEST_ID_PATTERN.test(match[1]);
+}
+
+/**
+ * Purpose-specific Grok Build OAuth transport for Imagine.
+ *
+ * Unlike text inference, Imagine calls the public xAI media endpoints. Keep
+ * this wrapper separate so widening media access cannot widen the Build proxy
+ * bearer boundary. The allowlist is checked before token refresh, headers are
+ * cloned, and proxy-only identity headers are forcibly removed.
+ */
+export function createXaiOAuthMediaFetch(
+  fetchImpl: typeof fetch = envProxyFetch,
+): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const target = typeof input === 'string'
+      ? new URL(input)
+      : input instanceof URL
+        ? input
+        : new URL(input.url);
+    const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    if (!isAllowedXaiMediaRequest(target, method)) {
+      throw new Error('Grok Build OAuth refused to send media credentials to a non-Imagine endpoint.');
+    }
+
+    const credentials = await ensureXaiTokenFresh();
+    if (!credentials) {
+      throw new Error('xAI OAuth credentials are unavailable. Reconnect Grok Build in Settings.');
+    }
+
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+    headers.delete('authorization');
+    headers.delete('x-xai-token-auth');
+    headers.delete('x-authenticateresponse');
+    headers.delete('x-grok-client-mode');
+    headers.delete('x-grok-model-override');
+    headers.set('Authorization', `Bearer ${credentials.accessToken}`);
+    headers.set('x-grok-client-version', XAI_GROK_BUILD_CLIENT_VERSION);
+    headers.set('x-grok-client-identifier', XAI_GROK_BUILD_CLIENT_IDENTIFIER);
+    const retryInput = input instanceof Request ? input.clone() : input;
+    const response = await fetchImpl(input, { ...init, method, headers });
+    if (response.status !== 401) return response;
+
+    const refreshed = await refreshXaiTokenAfterUnauthorized(credentials.accessToken);
+    if (!refreshed || refreshed.accessToken === credentials.accessToken) return response;
+    try { await response.body?.cancel(); } catch { /* best-effort release before retry */ }
+    headers.set('Authorization', `Bearer ${refreshed.accessToken}`);
+    return fetchImpl(retryInput, { ...init, method, headers });
   }) as typeof fetch;
 }
 
@@ -256,7 +373,7 @@ function rejectPendingBrowser(error: Error): void {
   pending?.reject(error);
 }
 
-async function startBrowserServer(): Promise<void> {
+async function startBrowserServer(): Promise<string> {
   const server = createServer(async (req, res) => {
     const origin = req.headers.origin;
     if (origin && !ALLOWED_CALLBACK_ORIGINS.has(origin)) {
@@ -281,8 +398,8 @@ async function startBrowserServer(): Promise<void> {
       res.end();
       return;
     }
-    const url = new URL(req.url || '/', `http://127.0.0.1:${XAI_OAUTH_CALLBACK_PORT}`);
-    if (req.method !== 'GET' || url.pathname !== '/callback') {
+    const url = new URL(req.url || '/', `http://${XAI_OAUTH_CALLBACK_HOST}`);
+    if (req.method !== 'GET' || url.pathname !== XAI_OAUTH_CALLBACK_PATH) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Not found');
       return;
@@ -319,6 +436,7 @@ async function startBrowserServer(): Promise<void> {
         code,
         pending.codeVerifier,
         pending.nonce,
+        pending.redirectUri,
         undefined,
         pending.controller.signal,
       );
@@ -341,21 +459,24 @@ async function startBrowserServer(): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once('error', error => {
       state.server = undefined;
-      const code = (error as NodeJS.ErrnoException).code;
-      reject(new Error(code === 'EADDRINUSE'
-        ? `xAI OAuth callback port ${XAI_OAUTH_CALLBACK_PORT} is already in use. Choose device-code login instead.`
-        : `xAI OAuth callback server failed: ${error.message}`));
+      reject(new Error(`xAI OAuth callback server failed: ${error.message}`));
     });
-    server.listen(XAI_OAUTH_CALLBACK_PORT, '127.0.0.1', resolve);
+    server.listen(0, XAI_OAUTH_CALLBACK_HOST, resolve);
   });
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    await stopBrowserServer();
+    throw new Error('xAI OAuth callback server did not expose a loopback port.');
+  }
+  return buildXaiOAuthRedirectUri(address.port);
 }
 
 export async function startXaiBrowserFlow(): Promise<{ authUrl: string; completion: Promise<void> }> {
   if (!isXaiOAuthEnabled()) throw new Error('xAI OAuth is disabled. Use xAI API Key instead.');
   await cancelXaiOAuthFlow();
   state.lastError = undefined;
-  const flow = prepareXaiBrowserFlow();
-  await startBrowserServer();
+  const redirectUri = await startBrowserServer();
+  const flow = prepareXaiBrowserFlow(redirectUri);
   const controller = new AbortController();
   state.browserController = controller;
   const completion = new Promise<void>((resolve, reject) => {
@@ -363,6 +484,7 @@ export async function startXaiBrowserFlow(): Promise<{ authUrl: string; completi
       state: flow.state,
       nonce: flow.nonce,
       codeVerifier: flow.codeVerifier,
+      redirectUri,
       controller,
       resolve,
       reject,

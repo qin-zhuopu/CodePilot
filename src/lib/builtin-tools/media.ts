@@ -1,9 +1,14 @@
 /**
  * builtin-tools/media.ts — Media import + image generation tools (Native Runtime).
  *
- * Phase 5d Phase 2 slice 2d (2026-05-17) — system prompt now
- * re-exports the canonical MCP-side `MEDIA_MCP_SYSTEM_PROMPT` from
- * `media-import-mcp.ts`.
+ * Phase 5d Phase 2 slice 2d (2026-05-17) — system prompt is shared
+ * with the MCP-side implementation.
+ *
+ * 2026-08-14 P1 — import the prompt from a dependency-free module,
+ * never from `media-import-mcp.ts`. That MCP module imports the Claude
+ * Agent SDK and becomes an async Turbopack chunk. A synchronous `require`
+ * from the Native tool registry then failed and silently removed this
+ * entire tool group from the real Next route.
  *
  * Phase 5e Phase 0.5 P1 (2026-05-17 Native MediaBlock 補齐) — image
  * generation + media import now emit `MediaBlock[]` via the harness
@@ -33,14 +38,15 @@
  * or the chat UI will silently miss its media block.
  */
 
-import { tool } from 'ai';
+import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
-import { MEDIA_MCP_SYSTEM_PROMPT } from '@/lib/media-import-mcp';
+import { MEDIA_CAPABILITY_SYSTEM_PROMPT } from '@/lib/media-capability-prompt';
 import type { MediaBlock } from '@/types';
 import { emitBuiltinEvent } from '@/lib/harness/builtin-event-bus';
 import { makeToolCompleted } from '@/lib/runtime/event-adapter';
+import { isXaiOAuthUsable } from '@/lib/xai-oauth-manager';
 
-export const MEDIA_SYSTEM_PROMPT = MEDIA_MCP_SYSTEM_PROMPT;
+export const MEDIA_SYSTEM_PROMPT = MEDIA_CAPABILITY_SYSTEM_PROMPT;
 
 /** Map a mime type to a MediaBlock.type slot the chat UI knows how to
  *  render. Same logic the Codex bridge uses (builtin-bridge.ts
@@ -82,11 +88,14 @@ function inferMimeFromPath(localPath: string): string {
 interface MediaToolOptions {
   sessionId?: string;
   workingDirectory?: string;
+  providerId?: string;
+  /** Test seam; production reads the current Grok Build OAuth status. */
+  grokVideoAvailable?: boolean;
 }
 
 export function createMediaTools(options?: MediaToolOptions) {
   const sessionId = options?.sessionId;
-  return {
+  const tools: ToolSet = {
     codepilot_import_media: tool({
       description: 'Import a local file (image, video, audio) into the CodePilot media library.',
       inputSchema: z.object({
@@ -155,33 +164,37 @@ export function createMediaTools(options?: MediaToolOptions) {
           }
           return `Media imported: ${localPath} (type=${mediaType})`;
         } catch (err) {
-          return `Failed: ${err instanceof Error ? err.message : 'unknown'}`;
+          throw err instanceof Error ? err : new Error('Media import failed');
         }
       },
     }),
 
     codepilot_generate_image: tool({
-      description: 'Generate an image using Gemini. The image appears inline in chat.',
+      description: 'Generate or edit an image using the configured media provider. Select grok-build when the user explicitly asks for Grok Imagine Image 2.0. The image appears inline in chat.',
       inputSchema: z.object({
         prompt: z.string().describe('Image generation prompt'),
+        provider: z.enum(['active', 'grok-build']).optional().describe('Use grok-build only when the user requests Grok Imagine; otherwise use the active media provider.'),
         aspectRatio: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4']).optional(),
         imageSize: z.enum(['1K', '2K']).optional(),
         referenceImagePaths: z.array(z.string()).optional(),
       }),
       execute: async (
-        { prompt, aspectRatio, imageSize, referenceImagePaths },
+        { prompt, provider, aspectRatio, imageSize, referenceImagePaths },
         execOptions,
       ) => {
-        const toolCallId = (execOptions as { toolCallId?: string } | undefined)?.toolCallId ?? '';
+        const execution = execOptions as { toolCallId?: string; abortSignal?: AbortSignal } | undefined;
+        const toolCallId = execution?.toolCallId ?? '';
         try {
           const { generateSingleImage } = await import('@/lib/image-generator');
           const result = await generateSingleImage({
             prompt,
+            providerId: provider === 'grok-build' ? 'xai-oauth' : undefined,
             aspectRatio,
             imageSize,
             referenceImagePaths,
             sessionId,
             cwd: options?.workingDirectory,
+            abortSignal: execution?.abortSignal,
           });
 
           // `generateSingleImage` returns either an `images[]` array
@@ -230,9 +243,66 @@ export function createMediaTools(options?: MediaToolOptions) {
           }
           return text;
         } catch (err) {
-          return `Failed: ${err instanceof Error ? err.message : 'unknown'}`;
+          throw err instanceof Error ? err : new Error('Image generation failed');
         }
       },
     }),
   };
+
+  const grokVideoAvailable = options?.grokVideoAvailable ?? isXaiOAuthUsable();
+  if (grokVideoAvailable) {
+    tools.codepilot_generate_video = tool({
+      description: 'Generate a video with Grok Imagine Video 1.5 using the connected Grok Build OAuth account. Supports text-to-video, a single first-frame image, or multiple reference images. The result appears inline and is saved to Gallery.',
+      inputSchema: z.object({
+        prompt: z.string().describe('Detailed video generation prompt'),
+        imagePath: z.string().optional().describe('Optional single source image to animate as the first frame'),
+        referenceImagePaths: z.array(z.string()).max(7).optional().describe('Optional style/content reference images; ignored when imagePath is provided'),
+        duration: z.union([z.literal(6), z.literal(10)]).optional(),
+        aspectRatio: z.enum(['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3']).optional(),
+        resolution: z.enum(['480p', '720p']).optional(),
+      }),
+      execute: async (
+        { prompt, imagePath, referenceImagePaths, duration, aspectRatio, resolution },
+        execOptions,
+      ) => {
+        const execution = execOptions as { toolCallId?: string; abortSignal?: AbortSignal } | undefined;
+        const toolCallId = execution?.toolCallId ?? '';
+        try {
+          const { generateGrokVideo } = await import('@/lib/xai-imagine');
+          const result = await generateGrokVideo({
+            prompt,
+            imagePath,
+            referenceImagePaths,
+            duration,
+            aspectRatio,
+            resolution,
+            sessionId,
+            runtimeId: 'codepilot_runtime',
+            cwd: options?.workingDirectory,
+            abortSignal: execution?.abortSignal,
+          });
+          const block: MediaBlock = {
+            type: 'video',
+            mimeType: result.mimeType,
+            localPath: result.localPath,
+            mediaId: result.mediaGenerationId,
+          };
+          const text = `Video generated successfully (${result.elapsedMs}ms). Local path: ${result.localPath}`;
+          if (sessionId && toolCallId) {
+            emitBuiltinEvent(
+              sessionId,
+              makeToolCompleted(
+                { runtimeId: 'codepilot_runtime', sessionId },
+                { toolId: toolCallId, output: text, media: [block] },
+              ),
+            );
+          }
+          return text;
+        } catch (err) {
+          throw err instanceof Error ? err : new Error('Video generation failed');
+        }
+      },
+    });
+  }
+  return tools;
 }

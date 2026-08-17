@@ -91,8 +91,7 @@
 import { WIDGET_SYSTEM_PROMPT, CANONICAL_SHOW_WIDGET_JSON } from '@/lib/widget-guidelines';
 import { MEMORY_SEARCH_SYSTEM_PROMPT } from '@/lib/memory-search-mcp';
 import { NOTIFICATION_MCP_SYSTEM_PROMPT } from '@/lib/notification-mcp';
-import { MEDIA_SYSTEM_PROMPT } from '@/lib/builtin-tools/media';
-import { MEDIA_MCP_SYSTEM_PROMPT } from '@/lib/media-import-mcp';
+import { MEDIA_CAPABILITY_SYSTEM_PROMPT } from '@/lib/media-capability-prompt';
 import { DASHBOARD_MCP_SYSTEM_PROMPT } from '@/lib/dashboard-mcp';
 
 // ─────────────────────────────────────────────────────────────────────
@@ -375,33 +374,33 @@ const assistantBuddy: CapabilityContract = {
 
 const imageGeneration: CapabilityContract = {
   id: 'image_generation',
-  displayName: 'AI image generation',
+  displayName: 'AI media generation',
   status: 'live',
-  toolNames: ['codepilot_generate_image'],
+  toolNames: ['codepilot_generate_image', 'codepilot_generate_video'],
   exposure: {
     claudecode_sdk: {
       kind: 'mcp_server',
       module: 'src/lib/image-gen-mcp.ts',
       factory: 'createImageGenMcpServer',
-      notes: 'Uses MEDIA_RESULT_MARKER text marker; claude-client.ts parses the marker and injects into SSE tool_result.media.',
+      notes: 'Image generation supports the configured provider; Grok Build OAuth additionally exposes Grok Imagine video generation. Both use MEDIA_RESULT_MARKER text markers, which claude-client.ts parses and injects into SSE tool_result.media.',
     },
     native: {
       kind: 'ai_sdk_tool',
       module: 'src/lib/builtin-tools/media.ts',
-      factory: 'createMediaTools (codepilot_generate_image key)',
-      notes: 'Phase 5e Phase 0.5 P1 (2026-05-17) — calls generateSingleImage and constructs MediaBlock[] (image type, mimeType from img.mimeType, localPath, mediaId from result.mediaGenerationId). Emits via the harness side-channel (`@/lib/harness/builtin-event-bus`); agent-loop.ts subscribes and splices into SSE `tool_result.media`. execute() return value is plain text (no JSON pollution model-side). Tool result shape parity with Codex bridge.',
+      factory: 'createMediaTools (codepilot_generate_image / codepilot_generate_video keys)',
+      notes: 'Calls generateSingleImage or generateGrokVideo and constructs MediaBlock[] with image/video type, mimeType, localPath and mediaId. Emits via the harness side-channel (`@/lib/harness/builtin-event-bus`); agent-loop.ts subscribes and splices into SSE `tool_result.media`. execute() return value is plain text (no JSON pollution model-side). Tool result shape parity with Codex bridge.',
     },
     codex_proxy: {
       kind: 'bridge_executable',
       module: 'src/lib/codex/proxy/builtin-bridge.ts',
-      factory: 'buildImageGenerationTool',
-      notes: 'Slice 2 + slice 4 fully wired with MediaBlock construction + materializeCodexEventMedia + side-channel emit. (Same side-channel bus the Native path now consumes since Phase 5e P1.)',
+      factory: 'buildImageGenerationTool / buildVideoGenerationTool',
+      notes: 'Both image and Grok Imagine video tools construct MediaBlock results, materialize Codex event media and emit through the same side-channel bus used by the Native path.',
     },
   },
-  // No canonical MCP-side prompt — the image-gen MCP relies on tool
-  // description + co-registered media MCP. We use the Native side's
-  // MEDIA_SYSTEM_PROMPT as the closest available canonical.
-  systemPromptFragment: MEDIA_SYSTEM_PROMPT,
+  // Image generation and media import share one dependency-free canonical
+  // prompt so Native tool assembly never pulls the Claude SDK into its
+  // synchronous Turbopack boundary.
+  systemPromptFragment: MEDIA_CAPABILITY_SYSTEM_PROMPT,
   toolResultShape: 'media',
   canonicalEventTypes: ['tool_started', 'tool_completed'],
   uiRenderPath: 'SSE tool_result.media → useSSEStream → SSECallbacks.onToolResult → MediaPreview (src/components/chat/MediaPreview.tsx)',
@@ -425,7 +424,7 @@ const mediaImport: CapabilityContract = {
       kind: 'mcp_server',
       module: 'src/lib/media-import-mcp.ts',
       factory: 'createMediaImportMcpServer',
-      notes: 'Authoritative. Owns MEDIA_MCP_SYSTEM_PROMPT (separate from builtin-tools/media.ts which carries the Native-only paraphrase). Registered by claude-client.ts under the `codepilot-media` MCP name.',
+      notes: 'Registered by claude-client.ts under the `codepilot-media` MCP name. The canonical prompt lives in dependency-free media-capability-prompt.ts and is re-exported here for compatibility.',
     },
     native: {
       kind: 'ai_sdk_tool',
@@ -440,10 +439,7 @@ const mediaImport: CapabilityContract = {
       notes: 'Slice 4 fix: MediaBlock.type matches mimeType prefix (image / video / audio). Same side-channel bus the Native path now consumes since Phase 5e P1.',
     },
   },
-  // Phase 5d slice 7b — switch canonical to the MCP-side
-  // MEDIA_MCP_SYSTEM_PROMPT now that we know it exists. Native +
-  // bridge use the same authority via re-export.
-  systemPromptFragment: MEDIA_MCP_SYSTEM_PROMPT,
+  systemPromptFragment: MEDIA_CAPABILITY_SYSTEM_PROMPT,
   toolResultShape: 'media',
   canonicalEventTypes: ['tool_started', 'tool_completed'],
   uiRenderPath: 'Same as image_generation — tool_result.media → MediaPreview.',

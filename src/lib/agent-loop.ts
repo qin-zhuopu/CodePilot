@@ -76,6 +76,12 @@ export interface AgentLoopOptions {
   abortController?: AbortController;
   /** Tools to make available to the model (if not provided, assembled from defaults) */
   tools?: ToolSet;
+  /**
+   * Optional resolved Grok-video authorization state. Production normally
+   * leaves this undefined so tool assembly reads OAuth state; deterministic
+   * runtime/golden tests set it explicitly.
+   */
+  grokVideoAvailable?: boolean;
   /** Permission mode for tool execution */
   permissionMode?: string;
   /** MCP servers to sync before assembling tools */
@@ -147,6 +153,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
     workingDirectory,
     abortController = new AbortController(),
     tools: toolsOverride,
+    grokVideoAvailable,
     thinking,
     effort,
     context1m,
@@ -266,6 +273,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             sessionProviderId,
             model: modelOverride || sessionModel,
             callScene,
+            grokVideoAvailable,
             bypassPermissions,
             permissionContext: bypassPermissions ? undefined : {
               sessionId,
@@ -553,7 +561,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           if (config.sdkType === 'xai') {
             providerOptions = {
               ...providerOptions,
-              xai: buildXaiProviderOptions(sanitized.effort),
+              xai: buildXaiProviderOptions(config.modelId, sanitized.effort),
             };
           }
 

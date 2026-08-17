@@ -40,12 +40,15 @@ import { cn } from "@/lib/utils";
  * at runtime too, not just at the static gate.
  */
 
-interface SearchCandidate {
+export interface SearchCandidate {
   modelId: string;
+  upstreamModelId?: string;
   displayName: string;
   contextWindow?: number;
   pricing?: { promptPerMillion?: number; completionPerMillion?: number };
   alreadyAdded: boolean;
+  existingHidden: boolean;
+  existingModelId?: string;
 }
 
 interface SearchModelsResponse {
@@ -80,6 +83,39 @@ function formatPrice(n: number | undefined): string | null {
   // OpenRouter prices vary 0.01 – 50+ per 1M; 2 decimals gives readability
   // without truncating cheap models to 0.00.
   return n < 0.1 ? n.toFixed(3) : n.toFixed(2);
+}
+
+export function filterSearchCandidates(
+  candidates: SearchCandidate[],
+  query: string,
+): SearchCandidate[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return candidates;
+  return candidates.filter(candidate =>
+    candidate.modelId.toLowerCase().includes(q)
+    || candidate.upstreamModelId?.toLowerCase().includes(q)
+    || candidate.displayName.toLowerCase().includes(q),
+  );
+}
+
+export function buildSearchCandidateMutation(candidate: SearchCandidate): {
+  method: 'POST' | 'PATCH';
+  body: Record<string, string | number>;
+} {
+  if (candidate.existingHidden && candidate.existingModelId) {
+    return {
+      method: 'PATCH',
+      body: { model_id: candidate.existingModelId, enabled: 1 },
+    };
+  }
+  return {
+    method: 'POST',
+    body: {
+      model_id: candidate.modelId,
+      upstream_model_id: candidate.upstreamModelId || candidate.modelId,
+      display_name: candidate.displayName,
+    },
+  };
 }
 
 export function OpenRouterSearchDialog({
@@ -154,44 +190,39 @@ export function OpenRouterSearchDialog({
     return () => {
       if (abortRef.current) abortRef.current.aborted = true;
     };
-  }, [open, providerId]);
+  }, [open, fetchCandidates]);
 
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return candidates;
-    return candidates.filter(c =>
-      c.modelId.toLowerCase().includes(q) || c.displayName.toLowerCase().includes(q),
-    );
+    return filterSearchCandidates(candidates, query);
   }, [candidates, query]);
 
   const handleAdd = async (candidate: SearchCandidate) => {
     if (addingId) return;
     setAddingId(candidate.modelId);
     try {
-      // POST /api/providers/[id]/models — manual add path. The route
-      // hardcodes source='manual', enable_source='manual_enabled',
-      // user_edited=1 server-side, so the body only needs the upstream
-      // identity fields. (Earlier draft used PUT, but the route only
-      // exposes GET/POST/PATCH/DELETE — PUT would 405 and the entire
-      // search-and-add flow would be a dead button.)
+      const mutation = buildSearchCandidateMutation(candidate);
       const res = await fetch(`/api/providers/${providerId}/models`, {
-        method: "POST",
+        method: mutation.method,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model_id: candidate.modelId,
-          upstream_model_id: candidate.modelId,
-          display_name: candidate.displayName,
-        }),
+        body: JSON.stringify(mutation.body),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body?.error || `${res.status} ${res.statusText}`);
       }
-      setAddedIds(prev => {
-        const next = new Set(prev);
-        next.add(candidate.modelId);
-        return next;
-      });
+      if (candidate.existingHidden) {
+        setCandidates(previous => previous.map(item =>
+          item.modelId === candidate.modelId
+            ? { ...item, existingHidden: false, alreadyAdded: true }
+            : item,
+        ));
+      } else {
+        setAddedIds(prev => {
+          const next = new Set(prev);
+          next.add(candidate.modelId);
+          return next;
+        });
+      }
       if (typeof window !== "undefined") {
         window.dispatchEvent(new Event("provider-changed"));
       }
@@ -199,9 +230,14 @@ export function OpenRouterSearchDialog({
     } catch (err) {
       showToast({
         type: "error",
-        message: t("provider.search.openrouter.addError" as TranslationKey, {
-          error: err instanceof Error ? err.message : String(err),
-        }),
+        message: t(
+          (candidate.existingHidden
+            ? "provider.search.openrouter.restoreError"
+            : "provider.search.openrouter.addError") as TranslationKey,
+          {
+            error: err instanceof Error ? err.message : String(err),
+          },
+        ),
         duration: 5000,
       });
     } finally {
@@ -331,7 +367,8 @@ export function OpenRouterSearchDialog({
             <div className="rounded-md bg-muted/40 overflow-y-auto flex-1 min-h-0">
               <div>
                 {filtered.map(candidate => {
-                  const isAdded = candidate.alreadyAdded || addedIds.has(candidate.modelId);
+                  const isAdded = (candidate.alreadyAdded && !candidate.existingHidden)
+                    || addedIds.has(candidate.modelId);
                   const isAdding = addingId === candidate.modelId;
                   const ctx = formatContextWindow(candidate.contextWindow);
                   const promptPrice = formatPrice(candidate.pricing?.promptPerMillion);
@@ -343,7 +380,9 @@ export function OpenRouterSearchDialog({
                     >
                       <div className="min-w-0 flex-1">
                         <div className="text-xs font-medium truncate">{candidate.displayName}</div>
-                        <div className="text-[11px] text-muted-foreground truncate">{candidate.modelId}</div>
+                        <div className="text-[11px] text-muted-foreground truncate">
+                          {candidate.upstreamModelId || candidate.modelId}
+                        </div>
                         {(ctx || (promptPrice && completionPrice)) && (
                           <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
                             {ctx && (
@@ -362,7 +401,25 @@ export function OpenRouterSearchDialog({
                           </div>
                         )}
                       </div>
-                      {isAdded ? (
+                      {candidate.existingHidden ? (
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                            {t("provider.search.openrouter.alreadyAddedHidden" as TranslationKey)}
+                          </span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2.5 text-xs gap-1"
+                            onClick={() => handleAdd(candidate)}
+                            disabled={isAdding || addingId !== null}
+                          >
+                            {isAdding && <SpinnerGap size={11} className="animate-spin" />}
+                            {isAdding
+                              ? t("provider.search.openrouter.restoring" as TranslationKey)
+                              : t("provider.search.openrouter.restoreButton" as TranslationKey)}
+                          </Button>
+                        </div>
+                      ) : isAdded ? (
                         <span
                           className={cn(
                             "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium shrink-0",

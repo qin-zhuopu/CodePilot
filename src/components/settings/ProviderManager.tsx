@@ -153,6 +153,7 @@ export function ProviderManager() {
   type XaiOAuthUiStatus = {
     enabled: boolean;
     authenticated: boolean;
+    usable?: boolean;
     email?: string;
     needsRefresh?: boolean;
     disabledReason?: string;
@@ -896,7 +897,8 @@ export function ProviderManager() {
         const hasOfficial = hasEnvClaude || officialDbProviders.length > 0;
         const hasCodePlan = codePlanDbProviders.length > 0;
         const hasThirdparty = thirdpartyDbProviders.length > 0;
-        const hasImage = imageDbProviders.length > 0;
+        const hasXaiMedia = !!xaiAuth?.authenticated || activeImageProviderId === 'xai-oauth';
+        const hasImage = imageDbProviders.length > 0 || hasXaiMedia;
         const isCompletelyEmpty = sorted.length === 0 && !hasEnvClaude && !openaiAuth?.authenticated && !xaiAuth?.authenticated;
 
         // Total = enabled + hidden in provider_models (or catalog size when
@@ -1091,6 +1093,63 @@ export function ProviderManager() {
           );
         };
 
+        // Grok Build OAuth is a virtual provider: the credential is managed
+        // by the login flow rather than an editable API-provider row. Surface
+        // its media entitlement in the same section where users choose their
+        // default image generator, while also making the video capability
+        // visible without inventing a separate "default video" setting.
+        const renderXaiOAuthMediaCard = () => {
+          const isActive = activeImageProviderId === 'xai-oauth';
+          const showStale = isActive && activeImageProviderStale;
+          const usable = xaiAuth?.usable ?? !!xaiAuth?.authenticated;
+          const status: ProviderCardStatus = usable ? 'available' : 'needs-config';
+          const statusLabel = showStale
+            ? (isZh ? '授权已失效' : 'Authorization stale')
+            : isActive
+              ? t('provider.activeForImage')
+              : undefined;
+
+          return (
+            <ProviderCard
+              key="xai-oauth-media"
+              isZh={isZh}
+              data={{
+                icon: getProviderIcon('xAI Grok', 'https://api.x.ai/v1'),
+                name: 'Grok Build',
+                status,
+                statusLabel,
+                compat: 'media_only',
+                info: [
+                  { label: isZh ? '图片模型' : 'Image model', value: 'Grok Imagine Image 2.0' },
+                  { label: isZh ? '视频模型' : 'Video model', value: 'Grok Imagine Video 1.5' },
+                  { label: isZh ? '接入方式' : 'Auth', value: isZh ? 'Grok Build 授权登录' : 'Grok Build OAuth' },
+                ],
+              }}
+              primaryAction={
+                showStale ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-3 text-xs text-muted-foreground"
+                    onClick={() => setActiveImageProvider('')}
+                  >
+                    {isZh ? '清除' : 'Clear'}
+                  </Button>
+                ) : !isActive && usable ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-3 text-xs text-muted-foreground"
+                    onClick={() => setActiveImageProvider('xai-oauth')}
+                  >
+                    {t('provider.useForImage')}
+                  </Button>
+                ) : undefined
+              }
+            />
+          );
+        };
+
         return (
           <div className="space-y-5">
             {/* Header: title + Add Service */}
@@ -1116,7 +1175,7 @@ export function ProviderManager() {
             {activeImageProviderStale && activeImageProviderId && !providers.some(
               p => p.id === activeImageProviderId
                 && (p.provider_type === 'gemini-image' || p.provider_type === 'openai-image'),
-            ) && (
+            ) && activeImageProviderId !== 'xai-oauth' && (
               <div className="rounded-md bg-amber-500/10 border border-amber-500/30 px-3 py-2 flex items-start gap-2">
                 <div className="flex-1 min-w-0">
                   <p className="text-xs text-amber-700 dark:text-amber-400">
@@ -1187,12 +1246,12 @@ export function ProviderManager() {
                           isZh={isZh}
                           data={{
                             icon: getProviderIcon('xAI Grok', 'https://api.x.ai/v1'),
-                            name: isZh ? 'xAI Grok OAuth' : 'xAI Grok OAuth',
+                            name: 'Grok Build OAuth',
                             status: 'available',
                             statusLabel: isZh ? '已登录' : 'Signed in',
                             compat: 'codepilot_only',
                             info: [
-                              { label: isZh ? '额度渠道' : 'Billing source', value: 'SuperGrok-compatible OAuth' },
+                              { label: isZh ? '额度渠道' : 'Billing source', value: 'Grok Build subscription' },
                               ...(xaiAuth.email ? [{ label: isZh ? '账号' : 'Account', value: xaiAuth.email }] : []),
                             ],
                           }}
@@ -1322,9 +1381,10 @@ export function ProviderManager() {
                 {hasImage && (
                   <section className="space-y-3">
                     <h4 className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
-                      {t('provider.imageServices')}
+                      {t('provider.mediaProviders')}
                     </h4>
                     <div className="grid gap-4 grid-cols-1 md:grid-cols-2">
+                      {hasXaiMedia && renderXaiOAuthMediaCard()}
                       {imageDbProviders.map(renderImageProviderCard)}
                     </div>
                   </section>
@@ -1382,11 +1442,11 @@ export function ProviderManager() {
                 },
                 {
                   key: 'xai-oauth',
-                  name: 'xAI Grok OAuth',
+                  name: 'Grok Build OAuth',
                   description: xaiAuth?.disabledReason
-                    || 'SuperGrok-compatible browser or device login; depends on xAI upstream policy. API Key remains available.',
+                    || 'Grok Build browser or device login; depends on xAI upstream policy. API Key remains available.',
                   descriptionZh: xaiAuth?.disabledReason
-                    || '兼容 SuperGrok 的浏览器/设备码登录，依赖 xAI 上游策略；可改用 API Key。',
+                    || 'Grok Build 浏览器/设备码登录，依赖 xAI 上游策略；可改用 API Key。',
                   icon: getProviderIcon('xAI Grok', 'https://api.x.ai/v1'),
                   onClick: () => {
                     setAddServiceOpen(false);
@@ -1883,11 +1943,11 @@ export function ProviderManager() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{isZh ? '登录 xAI Grok OAuth' : 'Sign in to xAI Grok OAuth'}</DialogTitle>
+            <DialogTitle>{isZh ? '登录 Grok Build OAuth' : 'Sign in to Grok Build OAuth'}</DialogTitle>
             <DialogDescription>
               {isZh
-                ? '这是兼容接入，复用公开 Grok CLI OAuth client，可能受 xAI 上游策略调整影响。xAI API Key 是独立且更稳定的备用渠道。'
-                : 'This compatibility login reuses the public Grok CLI OAuth client and may be affected by xAI policy changes. xAI API Key remains a separate, more stable fallback.'}
+                ? '这是兼容接入，复用 Grok Build 公开 OAuth client，可能受 xAI 上游策略调整影响。xAI API Key 是独立且更稳定的备用渠道。'
+                : 'This compatibility login reuses the public Grok Build OAuth client and may be affected by xAI policy changes. xAI API Key remains a separate, more stable fallback.'}
             </DialogDescription>
           </DialogHeader>
 

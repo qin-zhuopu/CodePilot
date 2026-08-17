@@ -82,6 +82,7 @@ import {
   settleSubagentRun,
 } from '@/lib/db';
 import { formatSubagentRunToolResult } from '@/lib/subagent-run-context';
+import { isXaiOAuthUsable } from '@/lib/xai-oauth-manager';
 // Phase 5d Phase 2 slice 2e (2026-05-17) — `WIDGET_SYSTEM_PROMPT`
 // import dropped: the bridge no longer holds a local WIDGET_PROMPT
 // scalar. Capability prompts are produced by the Context Compiler
@@ -92,6 +93,7 @@ import { formatSubagentRunToolResult } from '@/lib/subagent-run-context';
  *  are NOT forwarded to Codex (the bridge handled them already). */
 export const CODEPILOT_BUILTIN_TOOL_NAMES = [
   'codepilot_generate_image',
+  'codepilot_generate_video',
   'codepilot_import_media',
   'codepilot_memory_recent',
   'codepilot_memory_search',
@@ -121,6 +123,8 @@ export interface BuiltinBridgeOpts {
    *  adapter — `codex_account` should never reach here, but the
    *  guard below stays as defence in depth. */
   targetProviderId: string;
+  /** Test seam; production resolves this from the current OAuth bundle. */
+  grokVideoAvailable?: boolean;
 }
 
 /**
@@ -190,6 +194,9 @@ export function createCodePilotBuiltinTools(
   const tools: ToolSet = {};
 
   tools.codepilot_generate_image = buildImageGenerationTool(opts);
+  if (opts.grokVideoAvailable ?? isXaiOAuthUsable()) {
+    tools.codepilot_generate_video = buildVideoGenerationTool(opts);
+  }
   tools.codepilot_import_media = buildImportMediaTool(opts);
   tools.codepilot_load_widget_guidelines = buildWidgetGuidelinesTool(opts);
   tools.codepilot_notify = buildNotifyTool(opts);
@@ -741,6 +748,7 @@ async function runWithEvents(
 
 interface ImageGenInput {
   prompt: string;
+  provider?: 'active' | 'grok-build';
   aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4';
   imageSize?: '1K' | '2K';
   referenceImagePaths?: string[];
@@ -749,13 +757,18 @@ interface ImageGenInput {
 function buildImageGenerationTool(opts: BuiltinBridgeOpts) {
   return tool({
     description:
-      'Generate an image using the configured image provider. The generated image appears inline in the chat and is saved to the CodePilot media library. Use this when the user asks you to create, draw, or generate an image. Write prompts in English for best results.',
+      'Generate or edit an image using the configured image provider. Select grok-build for Grok Imagine Image 2.0. The generated image appears inline in the chat and is saved to the CodePilot media library.',
     inputSchema: jsonSchema({
       type: 'object',
       additionalProperties: false,
       required: ['prompt'],
       properties: {
         prompt: { type: 'string', description: 'Detailed image generation prompt in English' },
+        provider: {
+          type: 'string',
+          enum: ['active', 'grok-build'],
+          description: 'Use grok-build only when the user explicitly requests Grok Imagine.',
+        },
         aspectRatio: {
           type: 'string',
           enum: ['1:1', '16:9', '9:16', '4:3', '3:4'],
@@ -769,18 +782,20 @@ function buildImageGenerationTool(opts: BuiltinBridgeOpts) {
         },
       },
     } satisfies JSONSchema7),
-    execute: async (rawInput: unknown) => {
+    execute: async (rawInput: unknown, execOptions) => {
       const input = rawInput as ImageGenInput;
       return runWithEvents(opts, 'codepilot_generate_image', input, async () => {
         const { generateSingleImage, NoImageGeneratedError } = await import('@/lib/image-generator');
         try {
           const result = await generateSingleImage({
             prompt: input.prompt,
+            providerId: input.provider === 'grok-build' ? 'xai-oauth' : undefined,
             aspectRatio: input.aspectRatio,
             imageSize: input.imageSize,
             referenceImagePaths: input.referenceImagePaths,
             sessionId: opts.sessionId,
             cwd: opts.workspacePath,
+            abortSignal: execOptions.abortSignal,
           });
           const media: MediaBlock[] = result.images.map((img) => ({
             type: 'image' as const,
@@ -799,6 +814,71 @@ function buildImageGenerationTool(opts: BuiltinBridgeOpts) {
           }
           throw err;
         }
+      });
+    },
+  });
+}
+
+interface VideoGenInput {
+  prompt: string;
+  imagePath?: string;
+  referenceImagePaths?: string[];
+  duration?: 6 | 10;
+  aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4' | '3:2' | '2:3';
+  resolution?: '480p' | '720p';
+}
+
+function buildVideoGenerationTool(opts: BuiltinBridgeOpts) {
+  return tool({
+    description:
+      'Generate a video with Grok Imagine Video 1.5 through the connected Grok Build OAuth account. Supports text-to-video, a single source image as the first frame, or multiple reference images. The result appears inline and is saved to Gallery.',
+    inputSchema: jsonSchema({
+      type: 'object',
+      additionalProperties: false,
+      required: ['prompt'],
+      properties: {
+        prompt: { type: 'string', description: 'Detailed video generation prompt.' },
+        imagePath: { type: 'string', description: 'Optional source image to animate as the first frame.' },
+        referenceImagePaths: {
+          type: 'array',
+          maxItems: 7,
+          items: { type: 'string' },
+          description: 'Optional style/content reference images.',
+        },
+        duration: { type: 'number', enum: [6, 10], description: 'Video duration in seconds.' },
+        aspectRatio: {
+          type: 'string',
+          enum: ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'],
+        },
+        resolution: { type: 'string', enum: ['480p', '720p'] },
+      },
+    } satisfies JSONSchema7),
+    execute: async (rawInput: unknown, execOptions) => {
+      const input = rawInput as VideoGenInput;
+      return runWithEvents(opts, 'codepilot_generate_video', input, async () => {
+        const { generateGrokVideo } = await import('@/lib/xai-imagine');
+        const result = await generateGrokVideo({
+          prompt: input.prompt,
+          imagePath: input.imagePath,
+          referenceImagePaths: input.referenceImagePaths,
+          duration: input.duration,
+          aspectRatio: input.aspectRatio,
+          resolution: input.resolution,
+          sessionId: opts.sessionId,
+          runtimeId: 'codex_runtime',
+          cwd: opts.workspacePath,
+          abortSignal: execOptions.abortSignal,
+        });
+        const media: MediaBlock[] = [{
+          type: 'video',
+          mimeType: result.mimeType,
+          localPath: result.localPath,
+          mediaId: result.mediaGenerationId,
+        }];
+        return {
+          text: `Video generated successfully (${result.elapsedMs}ms). Local path: ${result.localPath}`,
+          media,
+        };
       });
     },
   });

@@ -55,6 +55,7 @@ describe('mutation-level — mutating tools must NOT be safe_read', () => {
     { name: 'codepilot_cancel_task', expectedLevel: 'mutating_local', danger: 'cancels user task' },
     { name: 'codepilot_hatch_buddy', expectedLevel: 'mutating_local', danger: 'creates buddy assets' },
     { name: 'codepilot_generate_image', expectedLevel: 'mutating_external', danger: 'third-party API + file write' },
+    { name: 'codepilot_generate_video', expectedLevel: 'mutating_external', danger: 'billed Grok Imagine API + file write' },
     { name: 'codepilot_import_media', expectedLevel: 'mutating_local', danger: 'writes user file to media lib' },
     { name: 'codepilot_dashboard_pin', expectedLevel: 'mutating_local', danger: 'mutates user dashboard' },
     { name: 'codepilot_dashboard_update', expectedLevel: 'mutating_local', danger: 'rewrites pinned widget' },

@@ -57,7 +57,7 @@ describe('Provider Catalog', () => {
       assert.equal(kimi.authStyle, 'api_key');
     });
 
-    // ── Phase 1 (2026-07-17): GLM-5.2 / Kimi for Coding ─────────────
+    // ── GLM-5.3 CodePlan / Kimi for Coding ─────────────────────────
     //
     // These pin the two USER-VISIBLE claims the catalog makes for the two
     // Coding Plans: which model name the user reads, and which effort tiers
@@ -73,89 +73,81 @@ describe('Provider Catalog', () => {
         assert.deepEqual(glmPresets[0].defaultModels, glmPresets[1].defaultModels);
       });
 
-      it('catalog is the GLM-5.2 generation — no superseded 5-Turbo / 5.1 rows', () => {
+      it('catalog is the current GLM-5.3 / 5-Turbo / 4.7 lineup', () => {
         for (const p of glmPresets) {
           const names = p.defaultModels.map(m => m.displayName);
-          assert.ok(names.includes('GLM-5.2'), `${p.key} should list GLM-5.2, got ${names.join(', ')}`);
-          for (const stale of ['GLM-5-Turbo', 'GLM-5.1']) {
+          assert.deepEqual(names, ['GLM-5.3', 'GLM-5-Turbo', 'GLM-4.7'], p.key);
+          for (const stale of ['GLM-5.2', 'GLM-5.1', 'GLM-4.5-Air']) {
             assert.ok(!names.includes(stale), `${p.key} still lists superseded ${stale}`);
           }
         }
       });
 
-      it('GLM-5.2 is listed once — sonnet+opus both map to it, so two rows would be one model twice', () => {
+      it('GLM-5.3 is listed once even though default, sonnet and opus roles share it', () => {
         for (const p of glmPresets) {
-          const glm52Rows = p.defaultModels.filter(m => m.displayName === 'GLM-5.2');
-          assert.equal(glm52Rows.length, 1, `${p.key} lists GLM-5.2 ${glm52Rows.length}×`);
+          const flagshipRows = p.defaultModels.filter(m => m.displayName === 'GLM-5.3');
+          assert.equal(flagshipRows.length, 1, `${p.key} lists GLM-5.3 ${flagshipRows.length}×`);
         }
       });
 
-      it('role env mapping points both sonnet and opus at glm-5.2', () => {
+      it('role mapping uses the Claude [1m] flagship and GLM-4.7 small slot', () => {
         for (const p of glmPresets) {
-          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_SONNET_MODEL, 'glm-5.2', p.key);
-          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_OPUS_MODEL, 'glm-5.2', p.key);
-          // haiku is unchanged this round — nothing in the research baseline
-          // says the small slot moved off 4.5-Air.
-          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'glm-4.5-air', p.key);
+          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_SONNET_MODEL, 'glm-5.3[1m]', p.key);
+          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_OPUS_MODEL, 'glm-5.3[1m]', p.key);
+          assert.equal(p.defaultEnvOverrides.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'glm-4.7', p.key);
+          assert.equal(p.defaultEnvOverrides.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '1000000', p.key);
+          assert.equal(p.defaultRoleModels?.default, 'glm-5.3[1m]', p.key);
         }
       });
 
-      it('effort capability declares exactly the two real tiers (high, max)', () => {
+      it('flagship effort capability declares exactly Low, High and Max', () => {
         for (const p of glmPresets) {
-          const glm52 = p.defaultModels.find(m => m.displayName === 'GLM-5.2');
-          assert.ok(glm52, `${p.key} missing GLM-5.2 row`);
-          assert.equal(glm52.capabilities?.supportsEffort, true, p.key);
-          assert.deepEqual(glm52.capabilities?.supportedEffortLevels, ['high', 'max'], p.key);
+          const flagship = p.defaultModels.find(m => m.displayName === 'GLM-5.3');
+          assert.ok(flagship, `${p.key} missing GLM-5.3 row`);
+          assert.equal(flagship.capabilities?.supportsEffort, true, p.key);
+          assert.deepEqual(flagship.capabilities?.supportedEffortLevels, ['low', 'high', 'max'], p.key);
+          assert.equal(flagship.capabilities?.defaultEffortLevel, 'max', p.key);
         }
       });
 
-      it('never offers the low/medium/xhigh tiers GLM silently folds away', () => {
-        // GLM maps low/medium/high → high and xhigh/max/ultracode → max, so a
-        // `low` row would charge the user for `high` while the button said Low.
+      it('never exposes compatibility aliases as fake distinct effort tiers', () => {
         for (const p of glmPresets) {
           for (const m of p.defaultModels) {
             const levels = m.capabilities?.supportedEffortLevels ?? [];
-            for (const fake of ['low', 'medium', 'xhigh']) {
+            for (const fake of ['medium', 'xhigh']) {
               assert.ok(!levels.includes(fake as 'low'), `${p.key}/${m.modelId} offers folded tier ${fake}`);
             }
           }
         }
       });
 
-      it('the two-tier menu carries a mapping note stating BOTH groups in both locales', () => {
-        const glm52 = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-5.2');
-        const key = glm52?.capabilities?.effortNoteKey;
-        assert.ok(key, 'GLM-5.2 must explain the six-to-two collapse in the menu');
+      it('the effort menu explains the documented Max default in both locales', () => {
+        const flagship = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-5.3');
+        const key = flagship?.capabilities?.effortNoteKey;
+        assert.ok(key, 'GLM-5.3 must explain Auto/default behavior in the menu');
         const enNote = en[key as keyof typeof en] as string;
         const zhNote = zh[key as keyof typeof zh] as string;
         assert.ok(enNote, `missing en string for ${key}`);
         assert.ok(zhNote, `missing zh string for ${key}`);
-        // Both source tiers must be named, or the note under-promises the
-        // fold: `ultracode` was missing from both locales in the first cut
-        // while the code comment claimed six-to-two.
-        for (const note of [enNote, zhNote]) {
-          for (const tier of ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']) {
-            assert.ok(
-              note.includes(tier),
-              `mapping note omits the ${tier} tier — reads as a partial mapping: "${note}"`,
-            );
-          }
-        }
+        assert.match(enNote, /Low.*High.*Max.*default.*Max/i);
+        assert.match(zhNote, /低.*高.*最大.*自动.*最大/);
       });
 
-      it('menu resolves to Auto + the two real tiers', () => {
-        const glm52 = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-5.2');
+      it('menu resolves to Auto + Low/High/Max', () => {
+        const flagship = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-5.3');
         assert.deepEqual(
-          resolveEffortMenuLevels(glm52?.capabilities?.supportedEffortLevels),
-          ['auto', 'high', 'max'],
+          resolveEffortMenuLevels(flagship?.capabilities?.supportedEffortLevels),
+          ['auto', 'low', 'high', 'max'],
         );
       });
 
-      it('GLM-4.5-Air declares no effort capability → selector hides, not guesses', () => {
-        const air = glmPresets[0].defaultModels.find(m => m.displayName === 'GLM-4.5-Air');
-        assert.ok(air, 'GLM-4.5-Air row missing');
-        assert.equal(air.capabilities?.supportsEffort, undefined);
-        assert.equal(resolveEffortMenuLevels(air.capabilities?.supportedEffortLevels), null);
+      it('GLM-5-Turbo and GLM-4.7 do not invent selectable effort tiers', () => {
+        for (const modelName of ['GLM-5-Turbo', 'GLM-4.7']) {
+          const model = glmPresets[0].defaultModels.find(m => m.displayName === modelName);
+          assert.ok(model, `${modelName} row missing`);
+          assert.equal(model.capabilities?.supportsEffort, undefined);
+          assert.equal(resolveEffortMenuLevels(model.capabilities?.supportedEffortLevels), null);
+        }
       });
     });
 

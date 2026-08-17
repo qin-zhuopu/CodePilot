@@ -27,6 +27,7 @@
 import type { ToolSet } from 'ai';
 import { adaptForNative } from '@/lib/harness/runtime-adapter';
 import { shouldSkipPermission } from '@/lib/harness/mutation-level';
+import { createMediaTools, MEDIA_SYSTEM_PROMPT } from './media';
 
 export interface BuiltinToolGroup {
   name: string;
@@ -45,6 +46,10 @@ export interface GetBuiltinToolsOptions {
    * MCP variant in claude-client.ts.
    */
   sessionId?: string;
+  /** Active chat provider. Grok Build OAuth routes image generation to Imagine. */
+  providerId?: string;
+  /** Test seam; production resolves this from the current OAuth bundle. */
+  grokVideoAvailable?: boolean;
   /**
    * #26: when true, mount only permission-safe (read-only) tools and emit
    * only their capability prompts. Plan / read-only mode uses this so the
@@ -267,6 +272,13 @@ export function getBuiltinTools(
 function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
   const groups: BuiltinToolGroup[] = [];
 
+  const reportLoadFailure = (group: string, error: unknown) => {
+    console.error('[builtin-tools] Failed to load built-in tool group', {
+      group,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  };
+
   // Notification tools — always available. Pass through the run
   // context so codepilot_schedule_task injects origin_session_id +
   // working_directory into /api/tasks/schedule POST body.
@@ -282,7 +294,7 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
         workingDirectory: options.workspacePath,
       }),
     });
-  } catch { /* notification module not available */ }
+  } catch (error) { reportLoadFailure('codepilot-notify', error); }
 
   // Widget guidelines — keyword-gated
   try {
@@ -294,7 +306,7 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
       condition: 'always',
       tools: createWidgetGuidelinesTools(),
     });
-  } catch { /* module not available */ }
+  } catch (error) { reportLoadFailure('codepilot-widget-guidelines', error); }
 
   // Dashboard tools — keyword-gated
   try {
@@ -306,19 +318,22 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
       condition: 'always',
       tools: createDashboardTools(),
     });
-  } catch { /* module not available */ }
+  } catch (error) { reportLoadFailure('codepilot-dashboard', error); }
 
-  // Media tools — keyword-gated
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createMediaTools, MEDIA_SYSTEM_PROMPT } = require('./media');
-    groups.push({
-      name: 'codepilot-media',
-      systemPrompt: MEDIA_SYSTEM_PROMPT,
-      condition: 'always',
-      tools: createMediaTools(),
-    });
-  } catch { /* module not available */ }
+  // Media is a required, always-on Native capability. Keep this as a static
+  // import so a bundling regression fails loudly at module/build time instead
+  // of degrading into a model that believes it has no media tools.
+  groups.push({
+    name: 'codepilot-media',
+    systemPrompt: MEDIA_SYSTEM_PROMPT,
+    condition: 'always',
+    tools: createMediaTools({
+      sessionId: options.sessionId,
+      workingDirectory: options.workspacePath,
+      providerId: options.providerId,
+      grokVideoAvailable: options.grokVideoAvailable,
+    }),
+  });
 
   // Memory search tools — workspace-gated
   if (options.workspacePath) {
@@ -331,7 +346,7 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
         condition: 'workspace',
         tools: createMemorySearchTools(options.workspacePath),
       });
-    } catch { /* module not available */ }
+    } catch (error) { reportLoadFailure('codepilot-memory', error); }
   }
 
   // Session history search tool — always available (queries SQLite messages table)
@@ -344,7 +359,7 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
       condition: 'always',
       tools: createSessionSearchTools(),
     });
-  } catch { /* module not available */ }
+  } catch (error) { reportLoadFailure('codepilot-session-search', error); }
 
   // AskUserQuestion — structured question UI for Native Runtime.
   // SDK Runtime has this built in; Native Runtime needs it as a builtin tool.
@@ -359,7 +374,7 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
       condition: 'always',
       tools: createAskUserQuestionTools(),
     });
-  } catch { /* module not available */ }
+  } catch (error) { reportLoadFailure('codepilot-ask-user', error); }
 
   // CLI tools — keyword-gated
   try {
@@ -371,7 +386,7 @@ function getToolGroups(options: GetBuiltinToolsOptions): BuiltinToolGroup[] {
       condition: 'always',
       tools: createCliToolsTools(),
     });
-  } catch { /* module not available */ }
+  } catch (error) { reportLoadFailure('codepilot-cli-tools', error); }
 
   return groups;
 }

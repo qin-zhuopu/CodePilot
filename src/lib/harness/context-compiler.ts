@@ -97,6 +97,14 @@ export interface CompilerInput {
    *  caller is responsible for gating logic (keyword / workspace /
    *  permission). The compiler trusts this set. */
   readonly enabledCapabilities: ReadonlySet<string> | null;
+  /**
+   * Concrete tool names the Runtime mounted for this request. When present,
+   * runtime hints are the intersection of the catalog contract and this set.
+   * This is required for auth-gated tools such as Grok video: enabling the
+   * image_generation capability must not advertise a video tool that the
+   * current OAuth state did not mount.
+   */
+  readonly availableToolNames?: ReadonlySet<string>;
   /** Pre-fetched assistant memory snapshot. Compiler builds memory
    *  fragments from this without touching disk. */
   readonly assistantMemory?: AssistantMemorySnapshot;
@@ -339,9 +347,8 @@ function deriveSourceFile(cap: CapabilityContract): string {
     case 'assistant_buddy':
       return 'src/lib/notification-mcp.ts';
     case 'image_generation':
-      return 'src/lib/builtin-tools/media.ts';
     case 'media_import':
-      return 'src/lib/media-import-mcp.ts';
+      return 'src/lib/media-capability-prompt.ts';
     case 'dashboard':
       return 'src/lib/dashboard-mcp.ts';
     case 'cli_tools':
@@ -361,9 +368,8 @@ function deriveSourceExport(cap: CapabilityContract): string {
     case 'assistant_buddy':
       return 'NOTIFICATION_MCP_SYSTEM_PROMPT';
     case 'image_generation':
-      return 'MEDIA_SYSTEM_PROMPT';
     case 'media_import':
-      return 'MEDIA_MCP_SYSTEM_PROMPT';
+      return 'MEDIA_CAPABILITY_SYSTEM_PROMPT';
     case 'dashboard':
       return 'DASHBOARD_MCP_SYSTEM_PROMPT';
     case 'cli_tools':
@@ -540,6 +546,9 @@ export function compileContext(input: CompilerInput): CompiledContext {
     // doesn't know per-tool schemas — those stay in MCP / AI SDK /
     // bridge factories).
     for (const toolName of cap.toolNames) {
+      if (input.availableToolNames && !input.availableToolNames.has(toolName)) {
+        continue;
+      }
       toolDescriptors.push({
         name: toolName,
         sourceCapability: cap.id,

@@ -281,6 +281,9 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
       enabledCapabilities: bridgeMounted
         ? capabilitiesFromBridgeToolNames(bridge.toolNames)
         : new Set<string>(),
+      // Auth-gated tools (currently Grok video) must be absent from compiler
+      // hints whenever the concrete bridge did not mount them.
+      availableToolNames: bridge.toolNames,
       userExtensions,
       externalExtensions,
       canonicalHarness,
@@ -364,10 +367,16 @@ export function createUnifiedAdapter(family: string): ResponsesAdapter {
               },
             }
           : {}),
-        ...(modelConfig.verifiedResponsesEffortLevels
+        ...(modelConfig.verifiedResponsesTransport
           ? {
               responses: {
-                verifiedEffortLevels: modelConfig.verifiedResponsesEffortLevels,
+                ...(modelConfig.verifiedResponsesEffortLevels
+                  ? { verifiedEffortLevels: modelConfig.verifiedResponsesEffortLevels }
+                  : {}),
+                ...(modelConfig.verifiedResponsesEffortAliases
+                  ? { effortAliases: modelConfig.verifiedResponsesEffortAliases }
+                  : {}),
+                supportsReasoningSummary: modelConfig.supportsResponsesReasoningSummary === true,
               },
             }
           : {}),
@@ -481,6 +490,7 @@ function capabilitiesFromBridgeToolNames(toolNames: ReadonlySet<string>): Set<st
   // The compiler will then look up exposure / fragment / artifact
   // details from the catalog.
   if (toolNames.has('codepilot_generate_image')) out.add('image_generation');
+  if (toolNames.has('codepilot_generate_video')) out.add('image_generation');
   if (toolNames.has('codepilot_import_media')) out.add('media_import');
   if (toolNames.has('codepilot_load_widget_guidelines')) out.add('widget');
   if (
@@ -802,7 +812,12 @@ export function buildProviderOptions(
     };
     /** Present only for a preset-verified native Responses transport. */
     responses?: {
-      verifiedEffortLevels: readonly ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+      verifiedEffortLevels?: readonly ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+      effortAliases?: Partial<Record<
+        'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+        'low' | 'medium' | 'high' | 'xhigh' | 'max'
+      >>;
+      supportsReasoningSummary?: boolean;
     };
   },
 ): AiProviderOptions | undefined {
@@ -815,6 +830,9 @@ export function buildProviderOptions(
   // that heuristic.
   if (context?.responses) {
     out.openai = { forceReasoning: true };
+    if (context.responses.supportsReasoningSummary) {
+      out.openai.reasoningSummary = 'detailed';
+    }
   }
 
   // Phase 5b smoke follow-up (2026-05-15) — Codex's `/responses`
@@ -844,7 +862,7 @@ export function buildProviderOptions(
   // xAI Responses has its own `store` contract. @ai-sdk/xai defaults it to
   // true; CodePilot does not use previousResponseId, so the shared xAI helper
   // explicitly disables upstream retention for this channel.
-  out.xai = buildXaiProviderOptions(body.reasoning?.effort);
+  out.xai = buildXaiProviderOptions(body.model, body.reasoning?.effort);
 
   const effort = body.reasoning?.effort;
   if (effort) {
@@ -856,7 +874,10 @@ export function buildProviderOptions(
     const anthropicThinking = mapEffortToAnthropicThinking(effort);
     const openaiReasoning = mapEffortToOpenAI(
       effort,
-      context?.responses?.verifiedEffortLevels,
+      context?.responses
+        ? context.responses.verifiedEffortLevels ?? []
+        : undefined,
+      context?.responses?.effortAliases,
     );
     if (context?.anthropic) {
       const sanitized = sanitizeClaudeModelOptions({
@@ -909,14 +930,17 @@ function mapEffortToAnthropicThinking(
 function mapEffortToOpenAI(
   effort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
   verifiedLevels?: readonly ('low' | 'medium' | 'high' | 'xhigh' | 'max')[],
+  verifiedAliases?: Partial<Record<
+    'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+    'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  >>,
 ): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined {
   if (verifiedLevels) {
     if (verifiedLevels.includes(effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max')) {
       return effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max';
     }
-    // DeepSeek documents xhigh as an alias of high. Keep that one explicit
-    // compatibility mapping; unknown tiers remain omitted rather than guessed.
-    if (effort === 'xhigh' && verifiedLevels.includes('high')) return 'high';
+    const mapped = verifiedAliases?.[effort];
+    if (mapped && verifiedLevels.includes(mapped)) return mapped;
     return undefined;
   }
   switch (effort) {

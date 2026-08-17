@@ -93,6 +93,7 @@ export const CODEPILOT_TOOL_MUTATION_LEVELS: Readonly<Record<string, MutationLev
   // Media — generation calls third-party API + writes file;
   // import writes user file into media library.
   codepilot_generate_image: 'mutating_external',
+  codepilot_generate_video: 'mutating_external',
   codepilot_import_media: 'mutating_local',
 
   // Session search — reads SQLite messages table.

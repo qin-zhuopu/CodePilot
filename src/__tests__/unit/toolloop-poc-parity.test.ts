@@ -386,6 +386,9 @@ async function runLoopScenario(loopFn: LoopFn, opts: ScenarioOptions): Promise<L
       workingDirectory: opts.workingDirectory,
       abortController,
       permissionMode: opts.permissionMode || 'normal',
+      // Golden is intentionally recorded in the logged-out OAuth state.
+      // Both loops must omit Grok video rather than inherit ambient settings.
+      grokVideoAvailable: false,
     });
     const raw = await collectStream(stream, (event) => opts.onEvent?.(event, abortController));
     return {

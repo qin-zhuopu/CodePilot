@@ -39,6 +39,7 @@ const video: AssetKindDescriptor = {
   producers: [
     'media-saver:base64',
     'media-saver:file-import',
+    'xai-imagine-video',
     'codex-media-import',
     'legacy-media-backfill',
   ],

@@ -42,7 +42,6 @@ import {
   liveCapabilities,
   deferredCapabilities,
   unsupportedCapabilities,
-  type CapabilityContract,
 } from '@/lib/harness/capability-contract';
 import { parseAllShowWidgets } from '@/components/chat/MessageItem';
 import {
@@ -188,12 +187,13 @@ describe('Codex bridge prompt does not redefine widget semantics', () => {
     );
   });
 
-  it('Native Runtime memory / notification / media builtin-tools files re-export MCP canonicals (slice 2d)', () => {
+  it('Native Runtime memory / notification / media builtin-tools files consume shared canonicals (slice 2d)', () => {
     // Phase 5d Phase 2 slice 2d (2026-05-17) — Native ran with its
     // own paraphrased prompts pre-Phase-5d. Slice 2d migrated them
-    // to re-export from the MCP-side authority files. Drift test
-    // pins each so a future commit re-introducing a local string
-    // trips here.
+    // to consume shared prompt authorities. Media now uses a pure
+    // dependency-free authority so Native loading cannot pull the
+    // Claude SDK async chunk into Turbopack. Drift tests pin each so
+    // a future commit re-introducing a local string trips here.
     const memorySrc = readSource('src/lib/builtin-tools/memory-search.ts');
     assert.match(
       memorySrc,
@@ -216,15 +216,27 @@ describe('Codex bridge prompt does not redefine widget semantics', () => {
       /export\s+const\s+NOTIFICATION_SYSTEM_PROMPT\s*=\s*NOTIFICATION_MCP_SYSTEM_PROMPT\s*;/,
     );
 
+    const mediaPromptSrc = readSource('src/lib/media-capability-prompt.ts');
     const mediaSrc = readSource('src/lib/builtin-tools/media.ts');
+    const mediaMcpSrc = readSource('src/lib/media-import-mcp.ts');
     assert.match(
       mediaSrc,
-      /import\s*\{[^}]*MEDIA_MCP_SYSTEM_PROMPT[^}]*\}\s*from\s*'@\/lib\/media-import-mcp'/,
-      'Native media must re-export from media-import-mcp.ts',
+      /import\s*\{[^}]*MEDIA_CAPABILITY_SYSTEM_PROMPT[^}]*\}\s*from\s*'@\/lib\/media-capability-prompt'/,
+      'Native media must consume the dependency-free canonical prompt',
     );
     assert.match(
       mediaSrc,
-      /export\s+const\s+MEDIA_SYSTEM_PROMPT\s*=\s*MEDIA_MCP_SYSTEM_PROMPT\s*;/,
+      /export\s+const\s+MEDIA_SYSTEM_PROMPT\s*=\s*MEDIA_CAPABILITY_SYSTEM_PROMPT\s*;/,
+    );
+    assert.match(
+      mediaMcpSrc,
+      /export\s+const\s+MEDIA_MCP_SYSTEM_PROMPT\s*=\s*MEDIA_CAPABILITY_SYSTEM_PROMPT\s*;/,
+      'Claude SDK MCP must consume the same dependency-free canonical prompt',
+    );
+    assert.doesNotMatch(
+      mediaPromptSrc,
+      /@anthropic-ai\/claude-agent-sdk|media-import-mcp|createSdkMcpServer/,
+      'canonical media prompt must stay dependency-free so Turbopack keeps Native media synchronous',
     );
   });
 
@@ -317,6 +329,23 @@ describe('Codex bridge prompt does not redefine widget semantics', () => {
       indexSrc,
       /adapted\.systemPromptText/,
       'getBuiltinTools must consume adapted.systemPromptText for the capability prompt slot (Phase 3 facade)',
+    );
+    assert.match(
+      indexSrc,
+      /import\s*\{[^}]*createMediaTools[^}]*MEDIA_SYSTEM_PROMPT[^}]*\}\s*from\s*['"]\.\/media['"]/,
+      'required Native media tools must use a static import so Turbopack cannot silently drop an async require',
+    );
+    assert.doesNotMatch(
+      indexSrc,
+      /require\(['"]\.\/media['"]\)/,
+      'Native media must not cross a synchronous require boundary in a Next/Turbopack route',
+    );
+
+    const toolGroupBody = indexSrc.slice(indexSrc.indexOf('function getToolGroups'));
+    assert.doesNotMatch(
+      toolGroupBody,
+      /catch\s*\{\s*(?:\/\*[\s\S]*?\*\/)?\s*\}/,
+      'built-in group load failures must be observable; empty catches create false capability success',
     );
   });
 
@@ -447,8 +476,12 @@ describe('Capability prompts inject WITHOUT a base systemPrompt (P1 fix, 2026-05
     const { tools, systemPrompts } = getBuiltinTools({
       workspacePath: '/tmp/test',
       prompt: '',
+      grokVideoAvailable: true,
     });
     assert.ok(Object.keys(tools).length > 0, 'getBuiltinTools must mount at least one tool (notify is always-on)');
+    assert.ok(tools.codepilot_generate_image, 'Native runtime must mount codepilot_generate_image');
+    assert.ok(tools.codepilot_generate_video, 'Native runtime must mount codepilot_generate_video');
+    assert.ok(tools.codepilot_import_media, 'Native runtime must mount codepilot_import_media');
     assert.ok(systemPrompts.length > 0, 'getBuiltinTools must return a non-empty systemPrompts array');
     assert.ok(
       systemPrompts[0].length > 0,
@@ -626,6 +659,7 @@ describe('Codex bridge tool surface matches the contract', () => {
       sessionId: 'contract-test',
       targetProviderId: 'prov-test',
       workspacePath: '/tmp/contract-test-workspace',
+      grokVideoAvailable: true,
     });
     const mounted = new Set(Object.keys(bridge.tools));
     for (const cap of HARNESS_CAPABILITIES) {

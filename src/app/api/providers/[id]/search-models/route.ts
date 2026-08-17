@@ -37,10 +37,13 @@ import type { ErrorResponse } from '@/types';
 
 interface SearchModelCandidate {
   modelId: string;
+  upstreamModelId?: string;
   displayName: string;
   contextWindow?: number;
   pricing?: { promptPerMillion?: number; completionPerMillion?: number };
   alreadyAdded: boolean;
+  existingHidden: boolean;
+  existingModelId?: string;
 }
 
 interface SearchModelsResponse {
@@ -74,10 +77,24 @@ export async function POST(
       );
     }
 
-    // Cross-reference with current provider_models to flag alreadyAdded
-    // — the dialog disables "add" on rows that are already in the local list.
+    // Cross-reference with current provider_models. Hidden is a distinct user
+    // state: presenting it as plain "Added" recreates the original complaint
+    // (the picker has no row, yet the dialog offers no recovery action).
     const localModels = getAllModelsForProvider(provider.id);
-    const localIds = new Set(localModels.flatMap(m => [m.model_id, m.upstream_model_id].filter(Boolean)));
+    const getPresence = (modelId: string, upstreamModelId = modelId) => {
+      const identities = new Set([modelId, upstreamModelId]);
+      const matches = localModels.filter(model =>
+        identities.has(model.model_id) || identities.has(model.upstream_model_id),
+      );
+      const existing = matches.find(model => model.enabled === 1)
+        ?? matches.find(model => model.model_id === modelId)
+        ?? matches[0];
+      return {
+        alreadyAdded: !!existing,
+        existingHidden: !!existing && existing.enabled !== 1,
+        ...(existing ? { existingModelId: existing.model_id } : {}),
+      };
+    };
 
     if (isOpenRouter) {
       // OpenRouter path — uses cached /v1/models with rich metadata
@@ -89,7 +106,7 @@ export async function POST(
           displayName: c.displayName,
           contextWindow: c.contextWindow,
           pricing: c.pricing,
-          alreadyAdded: localIds.has(c.modelId),
+          ...getPresence(c.modelId),
         })),
         total: candidates.length,
         cachedAt,
@@ -105,11 +122,16 @@ export async function POST(
     // directly and leave arbitrary ids to the dialog's manual-entry path.
     if (isCatalogOnlyPlanProviderRecord(provider) && matched?.defaultModels?.length) {
       const candidates: SearchModelCandidate[] = matched.defaultModels.map(model => {
-        const modelId = model.upstreamModelId || model.modelId;
+        const upstreamModelId = model.upstreamModelId || model.modelId;
         return {
-          modelId,
+          // Keep the catalog's stable local identity separate from the wire
+          // id. GLM-5.3 is stored as the long-lived `sonnet` row while Claude
+          // sends `glm-5.3[1m]`; using the wire id as modelId would create a
+          // duplicate row when the user adds a missing catalog candidate.
+          modelId: model.modelId,
+          upstreamModelId,
           displayName: model.displayName,
-          alreadyAdded: localIds.has(modelId) || localIds.has(model.modelId),
+          ...getPresence(model.modelId, upstreamModelId),
         };
       });
       return NextResponse.json<SearchModelsResponse>({
@@ -157,7 +179,7 @@ export async function POST(
       return {
         modelId,
         displayName: modelId,
-        alreadyAdded: localIds.has(modelId),
+        ...getPresence(modelId),
       };
     });
     const result: SearchModelsResponse = {

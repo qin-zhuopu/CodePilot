@@ -32,6 +32,7 @@ import {
 } from './db';
 import { ensureTokenFresh } from './openai-oauth-manager';
 import { CODEX_API_ENDPOINT } from './openai-oauth';
+import { XAI_GROK_BUILD_API_BASE_URL } from './xai-oauth';
 import { hasClaudeSettingsCredentials } from './claude-settings';
 import {
   getProviderCompat,
@@ -105,6 +106,30 @@ export interface ResolvedProvider {
    * compare against.
    */
   invalidReason?: 'provider-missing' | 'model-missing' | 'runtime-incompatible';
+}
+
+/** Model-level effort truth already carried by a resolved provider catalog. */
+export function getResolvedModelEffortContract(
+  resolved: ResolvedProvider,
+  modelOverride?: string,
+): { supportedLevels?: readonly ProviderEffortLevel[]; defaultLevel?: ProviderEffortLevel } {
+  const ids = new Set(
+    [modelOverride, resolved.model, resolved.upstreamModel].filter(
+      (value): value is string => typeof value === 'string' && value.length > 0,
+    ),
+  );
+  const model = resolved.availableModels.find(candidate =>
+    ids.has(candidate.modelId) || (!!candidate.upstreamModelId && ids.has(candidate.upstreamModelId)),
+  );
+  const capabilities = model?.capabilities;
+  return {
+    ...(capabilities?.supportsEffort && capabilities.supportedEffortLevels
+      ? { supportedLevels: capabilities.supportedEffortLevels }
+      : {}),
+    ...(capabilities?.defaultEffortLevel
+      ? { defaultLevel: capabilities.defaultEffortLevel }
+      : {}),
+  };
 }
 
 // ── Public API ──────────────────────────────────────────────────
@@ -413,6 +438,7 @@ export function toClaudeCodeEnv(
     'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK',
     'CLAUDE_CODE_SUBAGENT_MODEL',
     'CLAUDE_CODE_EFFORT_LEVEL',
+    'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
     'ENABLE_TOOL_SEARCH',
     'AWS_REGION',
     'AWS_ACCESS_KEY_ID',
@@ -598,6 +624,10 @@ export interface AiSdkConfig {
   verifiedAnthropicEffortLevels?: readonly ProviderEffortLevel[];
   /** Vendor-verified effort tiers for a native Responses wire. */
   verifiedResponsesEffortLevels?: readonly ProviderEffortLevel[];
+  /** Exact preset/model declared a native Responses transport, even without effort tiers. */
+  verifiedResponsesTransport?: true;
+  /** Vendor-documented aliases from Codex effort tokens to Responses tiers. */
+  verifiedResponsesEffortAliases?: Partial<Record<'minimal' | ProviderEffortLevel, ProviderEffortLevel>>;
   /** Whether the selected Responses endpoint accepts reasoning summaries. */
   supportsResponsesReasoningSummary?: boolean;
   /** Resolve bearer credentials per request from the atomic xAI OAuth bundle. */
@@ -726,7 +756,7 @@ export function toAiSdkConfig(
       sdkType: 'xai',
       apiKey: undefined,
       authToken: undefined,
-      baseUrl: 'https://api.x.ai/v1',
+      baseUrl: XAI_GROK_BUILD_API_BASE_URL,
       modelId,
       headers,
       processEnvInjections,
@@ -737,8 +767,8 @@ export function toAiSdkConfig(
   // A provider preset may declare a model-specific native Responses
   // transport for Codex Runtime. This is capability-driven rather than a
   // hostname special case: only an identity-resolved preset + explicitly
-  // listed model can take this path. DeepSeek V4 Flash is the first verified
-  // declaration; other DeepSeek models and aggregator copies keep the normal
+  // listed model can take this path. DeepSeek and GLM CodePlan both publish
+  // verified model-level declarations; aggregator copies keep the normal
   // Anthropic/OpenAI-compatible route.
   if (
     options.runtime === 'codex_runtime'
@@ -750,12 +780,18 @@ export function toAiSdkConfig(
       apiKey: provider.api_key || undefined,
       authToken: undefined,
       baseUrl: verifiedWire.codexResponses.baseUrl,
-      modelId,
+      modelId: verifiedWire.codexResponses.modelId,
       headers,
       processEnvInjections,
       useResponsesApi: true,
       responsesApiAuth: 'api_key',
-      verifiedResponsesEffortLevels: verifiedWire.codexResponses.supportedEffortLevels,
+      verifiedResponsesTransport: true,
+      ...(verifiedWire.codexResponses.supportedEffortLevels
+        ? { verifiedResponsesEffortLevels: verifiedWire.codexResponses.supportedEffortLevels }
+        : {}),
+      ...(verifiedWire.codexResponses.effortAliases
+        ? { verifiedResponsesEffortAliases: verifiedWire.codexResponses.effortAliases }
+        : {}),
       supportsResponsesReasoningSummary: verifiedWire.codexResponses.supportsReasoningSummary,
     };
   }
@@ -1165,12 +1201,29 @@ function buildResolution(
     if (dbAll.length > 0) {
       dbHiddenIds = new Set(dbAll.filter(m => m.enabled === 0).map(m => m.model_id));
       const dbEnabled = dbAll.filter(m => m.enabled === 1);
-      const dbCatalog: CatalogModel[] = dbEnabled.map(m => ({
-        modelId: m.model_id,
-        upstreamModelId: m.upstream_model_id || undefined,
-        displayName: m.display_name || m.model_id,
-        capabilities: safeParseCapabilities(m.capabilities_json),
-      }));
+      const dbCatalog: CatalogModel[] = dbEnabled.map(m => {
+        const catalogManaged = m.source === 'catalog'
+          && m.user_edited === 0
+          && m.enable_source !== 'manual_enabled'
+          && m.enable_source !== 'manual_hidden';
+        const currentCatalogEntry = catalogManaged
+          ? presetModels.find(candidate => candidate.modelId === m.model_id)
+          : undefined;
+        if (currentCatalogEntry) {
+          // Catalog-managed DB rows cache shipped defaults. Read current
+          // metadata immediately so a model release cannot leave the picker
+          // enriched but the actual wire on a stale upstream ID. The explicit
+          // align action still persists this shape; manual/user-edited rows
+          // remain strictly DB-wins.
+          return { ...currentCatalogEntry, modelId: m.model_id };
+        }
+        return {
+          modelId: m.model_id,
+          upstreamModelId: m.upstream_model_id || undefined,
+          displayName: m.display_name || m.model_id,
+          capabilities: safeParseCapabilities(m.capabilities_json),
+        };
+      });
       const dbIds = new Set(dbCatalog.map(m => m.modelId));
       availableModels = [
         ...dbCatalog,

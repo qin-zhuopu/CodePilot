@@ -88,6 +88,7 @@ export function runToolLoopAgentPoc(options: AgentLoopOptions): ReadableStream<s
     workingDirectory,
     abortController = new AbortController(),
     tools: toolsOverride,
+    grokVideoAvailable,
     thinking,
     effort,
     context1m,
@@ -163,6 +164,7 @@ export function runToolLoopAgentPoc(options: AgentLoopOptions): ReadableStream<s
             providerId,
             sessionProviderId,
             model: modelOverride || sessionModel,
+            grokVideoAvailable,
             permissionContext: bypassPermissions ? undefined : {
               sessionId,
               permissionMode: (permissionMode || 'normal') as PermissionMode,

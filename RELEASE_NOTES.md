@@ -1,45 +1,38 @@
-## CodePilot v0.66.2
+## CodePilot v0.67.1
 
-> 修复 macOS 安全存储授权与本地服务异常恢复问题，推荐所有 v0.66.0 用户升级。
+> 修复 GLM-5.3 在模型管理中显示“已添加”却无法看到或选择的问题，推荐使用智谱 CodePlan 的用户升级。
 
 ### 修复问题
 
-- **修复历史对话和文件树同时失效** — 本地服务异常退出后会暂停请求并进行有限次数的安全恢复；恢复成功后回到原页面，不再长期停留在 `Failed to fetch`、文件树加载失败或灰屏状态。
-- **修复恢复过程可能启动重复进程** — 只有在确认旧进程所有权安全时才自动恢复；无法确认时会停止重试并提示退出应用，避免多个 Codex 进程同时操作同一份本地数据。
-- **修复 macOS Safe Storage 反复授权** — 正式 macOS 安装包改用稳定的 Developer ID 身份并在上传前严格校验，降低升级后因签名身份变化而反复请求“CodePilot Safe Storage”权限的问题。
-- **修复异常退出统计重复** — 同一次本地服务退出只生成一条匿名错误记录，避免稳定性数据被重复计算。
+- **修复 GLM-5.3 未出现在模型列表** — 打开模型管理后，旧版 GLM-5.2 目录会安全更新为当前 GLM-5.3、GLM-5-Turbo 与 GLM-4.7，不再出现候选显示“已添加”但列表仍停留在旧模型的情况。
+- **修复隐藏模型无法恢复** — 已隐藏的 GLM 模型会明确显示“已添加（已隐藏）”，可以直接重新启用。
+- **修复删除后重新添加丢失模型能力** — 从官方目录重新添加 GLM-5.3 时，会保留正确的实际请求模型、推理档位和上下文能力。
+- **修复并发加载模型目录偶发失败** — 多个窗口或进程同时首次打开模型管理时，不再因重复写入导致请求失败。
 
 ### 优化改进
 
-- Codex 模型刷新增加超时取消、请求合并、冷却和空闲回收，降低卡住的后台进程长期占用资源的风险。
-- 本地服务输出增加按字节计算的 32 MiB 上限，避免异常大响应持续占用内存。
-- Electron 更新至 40.10.6，吸收同一主版本内的 Chromium 与 Electron 稳定性修复。
-- 本地服务异常观测只发送稳定分类、退出码和内存数值，不上传诊断原文、命令行、环境变量、路径或服务输出。
-
-### 已知限制
-
-- 本地服务内存异常的精确分配根因尚未在开发环境复现；本版增加了资源边界、卡死回收和故障恢复，但不宣称已消除所有 OOM 来源。
-- 从旧的临时签名版本首次升级到 Developer ID 版本时，macOS 可能仍要求授权一次；后续同一签名身份的版本不应重复请求。若钥匙串条目或访问控制列表已损坏，系统仍可能显示原生访问提示。
-- 如果崩溃时仍有无法验证归属的 Codex 子进程，CodePilot 会停止自动恢复并要求退出应用；必要时请清理残留进程或重启电脑后再打开。
+- 添加模型现在会同时识别 CodePilot 中的稳定模型 ID 和服务商实际模型 ID，避免同一个 GLM 模型重复出现。
+- 模型搜索支持按 `glm-5.3[1m]` 等服务商实际模型 ID 查找。
+- 目录同步只更新 CodePilot 管理且未被用户修改的模型；手动模型、用户编辑和隐藏状态不会被静默覆盖。
 
 ## 下载地址
 
 ### macOS
-- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-arm64.dmg)
-- [Intel](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-x64.dmg)
+- [Apple Silicon (M1/M2/M3/M4)](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-arm64.dmg)
+- [Intel](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-x64.dmg)
 
 ### Windows
-- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot.Setup.0.66.2.exe)
+- [Windows 安装包](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot.Setup.0.67.1.exe)
 
 ### Linux x64
-- [AppImage](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-x86_64.AppImage)
-- [deb](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-amd64.deb)
-- [rpm](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-x86_64.rpm)
+- [AppImage](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-x86_64.AppImage)
+- [deb](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-amd64.deb)
+- [rpm](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-x86_64.rpm)
 
 ### Linux arm64
-- [AppImage](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-arm64.AppImage)
-- [deb](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-arm64.deb)
-- [rpm](https://github.com/op7418/CodePilot/releases/download/v0.66.2/CodePilot-0.66.2-aarch64.rpm)
+- [AppImage](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-arm64.AppImage)
+- [deb](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-arm64.deb)
+- [rpm](https://github.com/op7418/CodePilot/releases/download/v0.67.1/CodePilot-0.67.1-aarch64.rpm)
 
 ## 安装说明
 

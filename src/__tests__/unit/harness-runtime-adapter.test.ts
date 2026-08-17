@@ -456,6 +456,11 @@ describe('Codex proxy — single source for stop / step / builtin tool names', (
     const src = adapterSrc();
     assert.match(
       src,
+      /availableToolNames:\s*bridge\.toolNames/,
+      'compiler hints must be filtered by the exact auth-gated bridge surface',
+    );
+    assert.match(
+      src,
       /const bridgeOwnedToolNames = new Set\(\[\s*\.\.\.adapted\.builtinToolNames,\s*\.\.\.bridge\.toolNames,/,
       'the concrete bridge suppression set must be seeded from adapter.builtinToolNames before adding runtime-mounted bridge names',
     );

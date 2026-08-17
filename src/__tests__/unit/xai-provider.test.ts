@@ -94,13 +94,19 @@ describe('xAI API Key provider', () => {
     assert.equal(classifyXaiSearchFailure(Object.assign(new Error('unavailable'), { statusCode: 503 }))?.code, 'XAI_X_SEARCH_UPSTREAM');
   });
 
-  it('ships one branded Grok 4.5 Responses preset', () => {
+  it('ships Grok 4.6 as the default branded Responses model and retains 4.5 as legacy', () => {
     const preset = getPreset('xai');
     assert.ok(preset);
     assert.equal(preset.protocol, 'xai');
     assert.equal(preset.baseUrl, 'https://api.x.ai/v1');
-    assert.deepEqual(preset.defaultModels.map(model => model.modelId), ['grok-4.5']);
-    assert.equal(preset.defaultRoleModels?.default, 'grok-4.5');
+    assert.deepEqual(preset.defaultModels.map(model => model.modelId), ['grok-4.6', 'grok-4.5']);
+    assert.equal(preset.defaultRoleModels?.default, 'grok-4.6');
+    const current = preset.defaultModels[0];
+    assert.equal(current.capabilities?.contextWindow, 500_000);
+    assert.equal(current.capabilities?.vision, true);
+    assert.equal(current.capabilities?.thinkingMode, 'always');
+    assert.deepEqual(current.capabilities?.supportedEffortLevels, ['low', 'medium', 'high']);
+    assert.equal(current.capabilities?.defaultEffortLevel, 'high');
     assert.equal(preset.meta?.modelDiscoveryMode, 'catalog_only');
   });
 
@@ -114,7 +120,7 @@ describe('xAI API Key provider', () => {
     assert.equal(findMatchingPresetForRecord(record)?.key, 'xai');
     const providerCompat = getProviderCompat(record);
     assert.equal(providerCompat, 'codepilot_only');
-    const modelCompat = getModelCompat({ modelId: 'grok-4.5', providerCompat });
+    const modelCompat = getModelCompat({ modelId: 'grok-4.6', providerCompat });
     assert.deepEqual([...(modelCompat.supportedRuntimes ?? [])].sort(), [
       'codepilot_runtime',
       'codex_runtime',
@@ -133,32 +139,33 @@ describe('xAI API Key provider', () => {
       protocol: 'xai',
       base_url: 'https://api.x.ai/v1',
       api_key: 'xai-test-key-never-send',
-      role_models_json: JSON.stringify({ default: 'grok-4.5' }),
+      role_models_json: JSON.stringify({ default: 'grok-4.6' }),
     });
     const resolved = resolveProvider({
       callScene: 'interactive_chat',
       providerId: provider.id,
-      model: 'grok-4.5',
+      model: 'grok-4.6',
     });
     const created = createModel({
       callScene: 'interactive_chat',
       resolvedProvider: resolved,
-      model: 'grok-4.5',
+      model: 'grok-4.6',
     });
     assert.equal(created.config.sdkType, 'xai');
-    assert.equal(created.config.modelId, 'grok-4.5');
+    assert.equal(created.config.modelId, 'grok-4.6');
     assert.equal(created.config.baseUrl, 'https://api.x.ai/v1');
     assert.match((created.languageModel as { provider: string }).provider, /^xai\.responses$/);
   });
 
   it('maps native and Codex effort to xAI namespace without inheriting OpenAI store state', async () => {
     const { buildProviderOptions } = await import('../../lib/codex/proxy/unified-adapter');
-    assert.equal(mapXaiReasoningEffort('minimal'), 'none');
-    assert.equal(mapXaiReasoningEffort('max'), 'high');
-    assert.deepEqual(buildXaiProviderOptions('xhigh'), { store: false, reasoningEffort: 'high' });
+    assert.equal(mapXaiReasoningEffort('grok-4.6', 'minimal'), undefined);
+    assert.equal(mapXaiReasoningEffort('grok-4.6', 'max'), 'high');
+    assert.equal(mapXaiReasoningEffort('grok-4.5', 'xhigh'), 'high');
+    assert.deepEqual(buildXaiProviderOptions('grok-4.6', 'xhigh'), { store: false, reasoningEffort: 'high' });
 
     const opts = buildProviderOptions({
-      model: 'grok-4.5',
+      model: 'grok-4.6',
       input: [],
       store: true,
       reasoning: { effort: 'high' },
@@ -170,7 +177,7 @@ describe('xAI API Key provider', () => {
   it('connection test uses a bounded, non-generating xAI model probe', () => {
     const source = fs.readFileSync(path.resolve(__dirname, '../../lib/claude-client.ts'), 'utf8');
     assert.match(source, /config\.protocol === 'xai'[\s\S]{0,120}testXaiConnection/);
-    assert.match(source, /fetch\(`\$\{baseUrl\}\/models\/grok-4\.5`/);
+    assert.match(source, /fetch\(`\$\{baseUrl\}\/models\/grok-4\.6`/);
     assert.doesNotMatch(source, /testXaiConnection[\s\S]{0,1600}messages:\s*\[/);
   });
 

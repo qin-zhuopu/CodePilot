@@ -305,6 +305,19 @@ export async function getCachedCodexEffortLevels(
 }
 
 /**
+ * Union of effort enum values advertised by the running app-server.
+ * This is a binary-capability proof for third-party provider models, which do
+ * not themselves appear in Codex Account's model/list.
+ */
+export async function getCachedCodexEffortVocabulary(): Promise<readonly string[] | undefined> {
+  const models = await listCodexModels({ cacheOnly: true });
+  const vocabulary = Array.from(new Set(
+    models.flatMap(model => model.supportedReasoningEfforts),
+  ));
+  return vocabulary.length > 0 ? vocabulary : undefined;
+}
+
+/**
  * Build the CodePilot ProviderModelGroup that surfaces Codex Account
  * models inside `/api/providers/models`. Returns null when no models
  * are available (account not logged in or list call failed).

@@ -2,14 +2,15 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   XAI_OAUTH_AUTHORIZE_URL,
-  XAI_OAUTH_CALLBACK_PORT,
+  XAI_OAUTH_CALLBACK_HOST,
+  XAI_OAUTH_CALLBACK_PATH,
   XAI_OAUTH_CLIENT_ID,
   XAI_OAUTH_DEVICE_URL,
-  XAI_OAUTH_REDIRECT_URI,
   XAI_OAUTH_SCOPE,
   XAI_OAUTH_TOKEN_URL,
   XaiOAuthTokenError,
   accessTokenIsExpiring,
+  buildXaiOAuthRedirectUri,
   exchangeXaiAuthorizationCode,
   parseJwtClaims,
   pollXaiDeviceTokens,
@@ -31,33 +32,40 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('xAI OAuth protocol primitives', () => {
-  it('pins the public Grok CLI client and registered callback contract', () => {
+  it('pins the public Grok Build client and loopback callback contract', () => {
     assert.equal(XAI_OAUTH_CLIENT_ID, 'b1a00492-073a-47ea-816f-4c329264a828');
-    assert.equal(XAI_OAUTH_CALLBACK_PORT, 56121);
-    assert.equal(XAI_OAUTH_REDIRECT_URI, 'http://127.0.0.1:56121/callback');
+    assert.equal(XAI_OAUTH_CALLBACK_HOST, '127.0.0.1');
+    assert.equal(XAI_OAUTH_CALLBACK_PATH, '/callback');
+    assert.equal(buildXaiOAuthRedirectUri(49231), 'http://127.0.0.1:49231/callback');
+    assert.throws(() => buildXaiOAuthRedirectUri(0), /port is invalid/);
     assert.equal(XAI_OAUTH_AUTHORIZE_URL, 'https://auth.x.ai/oauth2/authorize');
     assert.equal(XAI_OAUTH_TOKEN_URL, 'https://auth.x.ai/oauth2/token');
     assert.equal(XAI_OAUTH_DEVICE_URL, 'https://auth.x.ai/oauth2/device/code');
   });
 
-  it('builds PKCE S256 authorize URL with state, nonce, generic plan and CodePilot referrer', () => {
-    const flow = prepareXaiBrowserFlow();
+  it('builds the current Grok Build PKCE authorize URL with dynamic redirect and scopes', () => {
+    const redirectUri = buildXaiOAuthRedirectUri(49231);
+    const flow = prepareXaiBrowserFlow(redirectUri);
     const url = new URL(flow.authUrl);
     assert.equal(url.origin + url.pathname, XAI_OAUTH_AUTHORIZE_URL);
     assert.equal(url.searchParams.get('client_id'), XAI_OAUTH_CLIENT_ID);
-    assert.equal(url.searchParams.get('redirect_uri'), XAI_OAUTH_REDIRECT_URI);
+    assert.equal(url.searchParams.get('redirect_uri'), redirectUri);
     assert.equal(url.searchParams.get('scope'), XAI_OAUTH_SCOPE);
     assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
     assert.ok(url.searchParams.get('code_challenge'));
     assert.equal(url.searchParams.get('state'), flow.state);
     assert.equal(url.searchParams.get('nonce'), flow.nonce);
-    assert.equal(url.searchParams.get('plan'), 'generic');
-    assert.equal(url.searchParams.get('referrer'), 'codepilot');
+    assert.equal(url.searchParams.get('plan'), null);
+    assert.equal(url.searchParams.get('referrer'), 'grok-build');
+    assert.match(XAI_OAUTH_SCOPE, /conversations:read/);
+    assert.match(XAI_OAUTH_SCOPE, /conversations:write/);
+    assert.match(XAI_OAUTH_SCOPE, /workspaces:read/);
+    assert.match(XAI_OAUTH_SCOPE, /workspaces:write/);
   });
 
   it('generates independent state, nonce and verifier for each browser attempt', () => {
-    const first = prepareXaiBrowserFlow();
-    const second = prepareXaiBrowserFlow();
+    const first = prepareXaiBrowserFlow(buildXaiOAuthRedirectUri(49231));
+    const second = prepareXaiBrowserFlow(buildXaiOAuthRedirectUri(49232));
     assert.notEqual(first.state, second.state);
     assert.notEqual(first.nonce, second.nonce);
     assert.notEqual(first.codeVerifier, second.codeVerifier);
@@ -91,7 +99,8 @@ describe('xAI OAuth protocol primitives', () => {
 
   it('exchanges browser code with verifier and validates matching nonce', async () => {
     let captured = '';
-    const tokens = await exchangeXaiAuthorizationCode('auth-code', 'verifier', 'nonce-1', async (input, init) => {
+    const redirectUri = buildXaiOAuthRedirectUri(49231);
+    const tokens = await exchangeXaiAuthorizationCode('auth-code', 'verifier', 'nonce-1', redirectUri, async (input, init) => {
       assert.equal(String(input), XAI_OAUTH_TOKEN_URL);
       captured = String(init?.body);
       return jsonResponse({
@@ -104,13 +113,13 @@ describe('xAI OAuth protocol primitives', () => {
     const form = new URLSearchParams(captured);
     assert.equal(form.get('grant_type'), 'authorization_code');
     assert.equal(form.get('code_verifier'), 'verifier');
-    assert.equal(form.get('redirect_uri'), XAI_OAUTH_REDIRECT_URI);
+    assert.equal(form.get('redirect_uri'), redirectUri);
     assert.equal(tokens.refreshToken, 'refresh');
   });
 
   it('rejects an ID token with the wrong nonce', async () => {
     await assert.rejects(
-      () => exchangeXaiAuthorizationCode('code', 'verifier', 'expected', async () => jsonResponse({
+      () => exchangeXaiAuthorizationCode('code', 'verifier', 'expected', buildXaiOAuthRedirectUri(49231), async () => jsonResponse({
         access_token: 'access',
         id_token: jwt({ nonce: 'different' }),
       })),
@@ -120,7 +129,7 @@ describe('xAI OAuth protocol primitives', () => {
 
   it('rejects a browser exchange that cannot prove the nonce', async () => {
     await assert.rejects(
-      () => exchangeXaiAuthorizationCode('code', 'verifier', 'expected', async () => jsonResponse({
+      () => exchangeXaiAuthorizationCode('code', 'verifier', 'expected', buildXaiOAuthRedirectUri(49231), async () => jsonResponse({
         access_token: 'access-without-id-token',
       })),
       /did not include an ID token.*nonce validation/,
@@ -185,7 +194,10 @@ describe('xAI OAuth protocol primitives', () => {
   it('parses device authorization response and honors server interval', async () => {
     const authorization = await requestXaiDeviceAuthorization(async (input, init) => {
       assert.equal(String(input), XAI_OAUTH_DEVICE_URL);
-      assert.match(String(init?.body), /api%3Aaccess/);
+      const form = new URLSearchParams(String(init?.body));
+      assert.match(form.get('scope') ?? '', /api:access/);
+      assert.match(form.get('scope') ?? '', /workspaces:write/);
+      assert.equal(form.get('referrer'), 'grok-build');
       return jsonResponse({
         device_code: 'device-secret',
         user_code: 'ABCD-EFGH',

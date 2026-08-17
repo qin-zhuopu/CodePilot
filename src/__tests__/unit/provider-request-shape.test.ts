@@ -45,6 +45,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createXai, xaiTools } from '@ai-sdk/xai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { withChatImageDataUrlFetch } from '../../lib/openai-chat-image-normalizer';
+import { buildXaiProviderOptions } from '../../lib/xai-provider-options';
 
 // ── Constants ───────────────────────────────────────────────────
 
@@ -160,7 +161,7 @@ function cannedResponse(kind: ResponseKind): Response {
         id: 'resp_xai_fixture',
         object: 'response',
         created_at: 1,
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         status: 'completed',
         output: [],
         usage: {
@@ -333,7 +334,7 @@ function appXaiResponses(fetchImpl: typeof fetch): LanguageModel {
     baseURL: 'https://api.x.ai/v1',
     fetch: fetchImpl,
   });
-  return xai.responses('grok-4.5');
+  return xai.responses('grok-4.6');
 }
 
 function gatewayOpenAIChat(fetchImpl: typeof fetch): LanguageModel {
@@ -687,6 +688,30 @@ const XAI_PROVIDER_OPTIONS = {
 };
 
 describe('provider request shape — xAI Responses API', () => {
+  it('passes every UI/stale effort through the real builder and installed xAI SDK schema', async () => {
+    for (const [requested, expected] of [
+      ['minimal', undefined],
+      ['low', 'low'],
+      ['medium', 'medium'],
+      ['high', 'high'],
+      ['xhigh', 'high'],
+      ['max', 'high'],
+    ] as const) {
+      const req = await captureGenerate('openai-responses', appXaiResponses, {
+        prompt: PROMPT,
+        providerOptions: {
+          xai: buildXaiProviderOptions('grok-4.6', requested),
+        },
+      });
+      assert.equal(
+        req.body.reasoning?.effort,
+        expected,
+        `${requested} must reach fetch as ${expected ?? 'an omitted reasoning field'}`,
+      );
+      assert.equal(req.body.store, false);
+    }
+  });
+
   it('uses the branded /responses endpoint and xAI reasoning/store fields', async () => {
     const req = await captureGenerate('openai-responses', appXaiResponses, {
       system: SYSTEM,
@@ -694,7 +719,7 @@ describe('provider request shape — xAI Responses API', () => {
       providerOptions: XAI_PROVIDER_OPTIONS,
     });
     assert.equal(req.url, 'https://api.x.ai/v1/responses');
-    assert.equal(req.body.model, 'grok-4.5');
+    assert.equal(req.body.model, 'grok-4.6');
     assert.equal(req.body.reasoning?.effort, 'high');
     assert.equal(req.body.store, false);
     checkFixture('xai-responses-reasoning-effort', XAI_RESPONSES_META, req);
@@ -753,7 +778,7 @@ describe('provider request shape — xAI Responses API', () => {
       )) as typeof fetch,
     });
     await assert.rejects(
-      () => generateText({ model: xai.responses('grok-4.5'), prompt: PROMPT }),
+      () => generateText({ model: xai.responses('grok-4.6'), prompt: PROMPT }),
       /synthetic xAI rejection/,
     );
   });

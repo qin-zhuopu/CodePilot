@@ -1,7 +1,7 @@
 # Issue Tracker — 统一问题跟踪
 
 > 创建时间：2026-04-13
-> 最后更新：2026-08-13（v0.66.2 official-signed 跨平台 CI 与 12-asset Release 已发布；真实用户 cohort / 旧 ad-hoc ACL 迁移待观察）
+> 最后更新：2026-08-16（v0.67.1 GLM-5.3 模型管理热修已发布；CI 全绿，stable Release 12 assets uploaded）
 > 合并自：`open-issues-2026-03-12.md` + `v0.48-post-release-issues.md` + GitHub Issues 最新盘点
 
 **AI 须知：**
@@ -205,6 +205,15 @@ GitHub milestone `v0.56.x Stability / Trust`（#1）+ P0/P1 label 体系已建�
 - **已落地:** Codex stdout 改为 copy-before-cap 的 32 MiB byte-bounded NDJSON reader；`model/list` deadline abort、server-side single-flight、5 秒 cooldown、连续三次 signal 后 unhealthy idle recycle；Main-owned recovery safe mode 禁止 replacement server 启动 Codex/scheduler，并在 Chat 明示且禁发。Electron Main 新增 1s/2s/4s 有界 supervisor、stable-port health gate、poll pause/resume、self-contained recovery page、脱敏诊断、恢复交接 queue 与 current-generation descendant registry；live/PID-reuse/unverifiable tree 一律不 kill、fail-closed。2026-08-12 再补 stable opt-in、每 generation 一次的 utility fatal normalized Sentry event（只含稳定枚举和数值，raw report 丢弃）；SDK `ChildProcess` 保留 breadcrumb 但关闭自动 event，避免 `abnormal-exit` 双报；exit code 使用独立平台有界整数合同。最终 Developer ID verifier 的 `codesign` inspect/deep verify 有 15s/60s 进程级硬超时。Electron 40.2.1 升到同主版本 40.10.6。
 - **验证:** 原实现轮相关 transport/model/supervisor/registry/offline-page 定向测试 108/108，全量 `npm run test` 5179 pass / 0 fail / 1 skip（5180 tests）；`npm run build`、`npm run electron:build` 通过；禁用 Developer ID 自动发现后完整生成 ad-hoc signed arm64 目录包，deep/strict 签名、Resources/app.asar 0 source map 与 packaged `/api/health` verifier 全部通过。2026-08-12 Safe Storage/signing 补丁全量 5193/0/1，Electron 40.10.6 build/package/deep/strict/0-map/health 与 GUI recovery single/budget/blocked 三场通过；telemetry review follow-up 定向 32/32、全量 5193/0/1；P3 follow-up 定向 9/9、全量 5194/0/1（5195 tests），Electron production build 通过。blocked 保持 quit-only。v0.66.1 official CI run 31615349470 证明证书已导入但 `CSC_IDENTITY_AUTO_DISCOVERY=false` 仍令 electron-builder 跳过身份选择；afterSign 按预期 fail-closed，未创建 Release。修正后 v0.66.2 run [`31616811316`](https://github.com/op7418/CodePilot/actions/runs/31616811316) 的 macOS Developer ID 双架构 package/final verifier、Windows、Linux x64/arm64 与 release job 全绿；[Release](https://github.com/op7418/CodePilot/releases/tag/v0.66.2) 为非 draft/非 prerelease且 12 assets uploaded。真实 active-turn/soak/cohort 仍是独立验收。
 - **下一步:** 用可控 provider/凭据跑 active-turn interruption、历史 route/文件树恢复；跑 fresh/history 15 分钟和长任务 60 分钟内存曲线；下一 stable 核验 utility fatal event 的脱敏/分组和 Graphite/utility crash cohort。条件允许时在受影响机器执行经批准的 profile/heap/network A/B。未获外部分发/机器 A/B 授权时继续只做本地/合成验证。
+
+#### B-031 GLM-5.3 显示已添加但模型管理仍停在 5.2
+- **状态:** 🟢 v0.67.1 hotfix Shipped + Code complete + Tests pass + Build pass + isolated UI smoke passed；修复后 Claude 复审未重跑
+- **现象:** v0.67.0 用户在 GLM (CN) 的 Add Model 看到 GLM-5.3“已添加”，但 Models 列表仍只有旧 GLM-5.2，composer 也没有可选的 5.3 行。
+- **根因:** Runtime/final picker 有当前 catalog 的只读 enrichment，但 per-provider Models GET 只在空表 seed，已有 SQLite 快照不升级；Add Model 又把 stable alias 与 wire id 混作一个“已添加”布尔值。初版热修复审还发现并发 INSERT、同 upstream 双行、hidden 候选无恢复动作，以及 catalog 重加被降级成 manual 空能力行。
+- **修复:** catalog-only plan 的 Models GET 执行非破坏 merge；stable/wire identity 分离并双查重；候选区分 enabled/hidden/missing，hidden 可直接重新启用；精确 catalog POST 从服务端目录恢复 display/upstream/capabilities/source/order；冲突插入与用户排序有反例测试。
+- **边界:** 不自动清理历史 user-owned 双行（可能被 session pin），需要未来 preview-first 整理；当前 catalog 项若只想停用应“隐藏”，物理删除后会被目录重新物化。
+- **验证:** 定向 210/210；标准全量 5257 pass / 0 fail / 1 skipped（5258 tests）；production build 136 pages；隔离 UI 已验证 `glm-5.3[1m]` 搜索、hidden 恢复、3/3 列表刷新与正确 stable/wire 映射，控制台无 warning/error，真实用户 DB 未写入。
+- **发布:** v0.67.1（commit `634a0dc7`；CI `31898968564` 全绿；stable Release 12 assets uploaded）
 
 ---
 

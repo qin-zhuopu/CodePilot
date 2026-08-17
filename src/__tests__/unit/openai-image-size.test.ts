@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mapAspectToOpenAISize } from '../../lib/image-generator';
+import { mapAspectToOpenAISize, shouldUseXaiOAuthImageProvider } from '../../lib/image-generator';
 
 // GPT Image 2 constraints, per OpenAI Image generation guide.
 const MAX_EDGE = 3840;
@@ -16,6 +16,29 @@ const UI_ASPECT_RATIOS = [
   '1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4', '4:5', '5:4', '21:9',
 ] as const;
 const UI_SIZES = ['1K', '2K', '4K'] as const;
+
+describe('Grok Build active-image selection precedence', () => {
+  it('uses the Settings virtual provider when no provider/model override exists', () => {
+    assert.equal(shouldUseXaiOAuthImageProvider({ activeProviderId: 'xai-oauth' }), true);
+  });
+
+  it('lets explicit provider and model-family choices override the Settings default', () => {
+    assert.equal(shouldUseXaiOAuthImageProvider({
+      providerId: 'db-image-provider',
+      activeProviderId: 'xai-oauth',
+    }), false);
+    assert.equal(shouldUseXaiOAuthImageProvider({
+      requestedFamily: 'openai',
+      activeProviderId: 'xai-oauth',
+    }), false);
+    assert.equal(shouldUseXaiOAuthImageProvider({ providerId: 'xai-oauth' }), true);
+    assert.equal(shouldUseXaiOAuthImageProvider({ requestedFamily: 'xai' }), true);
+  });
+
+  it('does not let the text chat provider override the Settings media route', () => {
+    assert.equal(shouldUseXaiOAuthImageProvider({ activeProviderId: 'db-image-provider' }), false);
+  });
+});
 
 function parseSize(s: string): { w: number; h: number } {
   const m = /^(\d+)x(\d+)$/.exec(s);

@@ -54,9 +54,11 @@ import {
   findCodexBinary,
   getCodexAutoReviewCapability,
   getCodexAppServer,
+  getCodexAvailability,
 } from './app-server-manager';
-import { resolveCodexEffort } from './effort';
-import { getCachedCodexEffortLevels } from './models';
+import { resolveCodexEffort, resolveCodexProviderEffort } from './effort';
+import { getCachedCodexEffortLevels, getCachedCodexEffortVocabulary } from './models';
+import { getResolvedModelEffortContract, resolveProvider } from '@/lib/provider-resolver';
 import { reconcileCodexPermissionEcho, resolveCodexPermissionWire } from './permission';
 import { buildReviewEvent } from '@/lib/permission/review-event';
 import { emitReviewEvent } from '@/lib/permission/review-audit';
@@ -1097,8 +1099,36 @@ export const codexRuntime: AgentRuntime = {
           // conservative clamp inside resolveCodexEffort. cacheOnly read —
           // turn/start must never spawn an app-server (P0.3).
           // codex_runtime only; Claude Code / Native keep the full union.
-          const declaredEfforts = await getCachedCodexEffortLevels(options.model);
-          const codexEffort = resolveCodexEffort(options.effort, declaredEfforts);
+          let codexEffort: string | undefined;
+          if (requestedProviderId === 'codex_account') {
+            const declaredEfforts = await getCachedCodexEffortLevels(options.model);
+            codexEffort = resolveCodexEffort(options.effort, declaredEfforts);
+          } else {
+            const resolvedProvider = resolveProvider({
+              providerId: requestedProviderId,
+              model: options.model,
+              runtime: 'codex_runtime',
+              callScene: options.callScene,
+            });
+            const resolvedExactly = requestedProviderId === 'openai-oauth'
+              ? resolvedProvider._openaiOAuth === true
+              : requestedProviderId === 'xai-oauth'
+                ? resolvedProvider._xaiOAuth === true
+                : resolvedProvider.provider?.id === requestedProviderId;
+            const contract = resolvedExactly
+              ? getResolvedModelEffortContract(resolvedProvider, options.model)
+              : {};
+            // The app-server is already initialized at this point, so this
+            // cache-only availability read exposes its binary version without
+            // requiring a Codex Account login or spawning another process.
+            const availability = await getCodexAvailability();
+            codexEffort = resolveCodexProviderEffort(
+              options.effort,
+              contract,
+              await getCachedCodexEffortVocabulary(),
+              availability.kind === 'ready' ? availability.version : undefined,
+            );
+          }
           // #632 / Phase 2 #3 — include image attachments in the turn input.
           // Files reach the runtime via runtimeOptions.files (claude-client.ts);
           // before this the input was text-only and images were silently dropped.

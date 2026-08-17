@@ -85,16 +85,16 @@ export interface ExpectedDifference {
 /**
  * Initial ledger after Phase 5d Phase 2 slice 2d (2026-05-17) — the
  * three Native paraphrase entries for memory / tasks_and_notify /
- * media_import have been consumed. Native source files now
- * re-export from the MCP canonical:
+ * media_import have been consumed. Native source files now consume
+ * the same canonical prompt authorities as the MCP adapters:
  *
  *   - `src/lib/builtin-tools/memory-search.ts` → re-exports
  *     `MEMORY_SEARCH_SYSTEM_PROMPT` from `memory-search-mcp.ts`
  *   - `src/lib/builtin-tools/notification.ts` → re-exports
  *     `NOTIFICATION_MCP_SYSTEM_PROMPT` (keeping the local name
  *     `NOTIFICATION_SYSTEM_PROMPT` for call-site stability)
- *   - `src/lib/builtin-tools/media.ts` → re-exports
- *     `MEDIA_MCP_SYSTEM_PROMPT` from `media-import-mcp.ts`
+ *   - `src/lib/builtin-tools/media.ts` and `media-import-mcp.ts` →
+ *     both derive from dependency-free `media-capability-prompt.ts`
  *
  * Phase 5e Phase 0.5 P1 (2026-05-17 Native MediaBlock 補齐) — the
  * final `tool_result_shape_canonicalized` follow_up entry for

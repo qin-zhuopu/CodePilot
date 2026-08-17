@@ -28,7 +28,7 @@ export interface ImageGenResult {
 /** What the active-image endpoint returns when a usable media provider is set. */
 interface ActiveImageInfo {
   providerName?: string;
-  providerType?: 'gemini-image' | 'openai-image';
+  providerType?: 'gemini-image' | 'openai-image' | 'xai-oauth';
   model?: string;
   modelLabel?: string;
   stale: boolean;
@@ -36,6 +36,10 @@ interface ActiveImageInfo {
 
 const ASPECT_RATIOS = [
   '1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4', '4:5', '5:4', '21:9',
+] as const;
+
+const XAI_ASPECT_RATIOS = [
+  '1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4',
 ] as const;
 
 const RESOLUTIONS = ['1K', '2K', '4K'] as const;
@@ -104,6 +108,24 @@ export function ImageGenConfirmation({
       window.removeEventListener('provider-changed', handler);
     };
   }, []);
+
+  // Grok Imagine Image 2.0 exposes 1K/2K. If the active provider changes
+  // from a 4K-capable provider while this confirmation card is open, move to
+  // the highest honest option instead of silently sending 4K as 1K.
+  useEffect(() => {
+    if (activeInfo?.providerType === 'xai-oauth' && resolution === '4K') {
+      setResolution('2K');
+    }
+  }, [activeInfo?.providerType, resolution]);
+
+  useEffect(() => {
+    if (
+      activeInfo?.providerType === 'xai-oauth'
+      && !XAI_ASPECT_RATIOS.includes(aspectRatio as typeof XAI_ASPECT_RATIOS[number])
+    ) {
+      setAspectRatio('1:1');
+    }
+  }, [activeInfo?.providerType, aspectRatio]);
 
 
   const handleStop = useCallback(() => {
@@ -229,7 +251,7 @@ export function ImageGenConfirmation({
     } finally {
       abortRef.current = null;
     }
-  }, [prompt, aspectRatio, resolution, initialPrompt, sessionId, messageId, referenceImages]);
+  }, [prompt, aspectRatio, resolution, initialPrompt, sessionId, messageId, rawRequestBlock, referenceImages]);
 
   const handleRegenerate = useCallback(() => {
     setResult(null);
@@ -354,7 +376,7 @@ export function ImageGenConfirmation({
             {t('imageGen.aspectRatio' as TranslationKey)}
           </label>
           <div className="flex flex-wrap gap-1.5">
-            {ASPECT_RATIOS.map((ratio) => (
+            {(activeInfo?.providerType === 'xai-oauth' ? XAI_ASPECT_RATIOS : ASPECT_RATIOS).map((ratio) => (
               <Button
                 key={ratio}
                 variant="outline"
@@ -379,7 +401,7 @@ export function ImageGenConfirmation({
             {t('imageGen.resolution' as TranslationKey)}
           </label>
           <div className="flex items-center gap-1.5">
-            {RESOLUTIONS.map((res) => (
+            {(activeInfo?.providerType === 'xai-oauth' ? RESOLUTIONS.slice(0, 2) : RESOLUTIONS).map((res) => (
               <Button
                 key={res}
                 variant="outline"

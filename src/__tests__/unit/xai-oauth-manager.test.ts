@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { generateText } from 'ai';
+import { createXai } from '@ai-sdk/xai';
 
 const originalDataDir = process.env.CLAUDE_GUI_DATA_DIR;
 const originalFeatureSwitch = process.env.CODEPILOT_XAI_OAUTH_ENABLED;
@@ -25,6 +27,12 @@ function jwt(claims: Record<string, unknown>): string {
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function callbackUrl(flow: { authUrl: string }, query = ''): string {
+  const redirectUri = new URL(flow.authUrl).searchParams.get('redirect_uri');
+  assert.ok(redirectUri, 'authorize URL must carry the dynamic redirect URI');
+  return `${redirectUri}${query}`;
 }
 
 beforeEach(async () => {
@@ -153,29 +161,96 @@ describe('xAI OAuth manager lifecycle', () => {
     assert.equal(manager.readXaiOAuthBundle(), undefined);
   });
 
-  it('fetch override replaces a dummy bearer without mutating caller headers', async () => {
+  it('fetch override injects the complete Build proxy contract without mutating caller headers', async () => {
     manager.saveXaiOAuthTokens({ accessToken: 'fresh-access', expiresAt: Date.now() + 3600_000 });
-    const callerHeaders = new Headers({ Authorization: 'Bearer dummy', 'x-test': 'keep' });
+    const callerHeaders = new Headers({
+      Authorization: 'Bearer dummy',
+      'x-grok-client-version': 'caller-version',
+      'x-grok-model-override': 'caller-model',
+      'x-test': 'keep',
+    });
     let observed: Headers | undefined;
-    const wrapped = manager.createXaiOAuthFetch((async (_input, init) => {
+    const wrapped = manager.createXaiOAuthFetch('grok-4.6', (async (_input, init) => {
       observed = new Headers(init?.headers);
       return jsonResponse({ ok: true });
     }) as typeof fetch);
-    await wrapped('https://api.x.ai/v1/responses', { headers: callerHeaders });
+    await wrapped('https://cli-chat-proxy.grok.com/v1/responses', { headers: callerHeaders });
     assert.equal(callerHeaders.get('authorization'), 'Bearer dummy');
+    assert.equal(callerHeaders.get('x-grok-client-version'), 'caller-version');
+    assert.equal(callerHeaders.get('x-grok-model-override'), 'caller-model');
     assert.equal(observed?.get('authorization'), 'Bearer fresh-access');
+    assert.equal(observed?.get('x-xai-token-auth'), 'xai-grok-cli');
+    assert.equal(observed?.get('x-authenticateresponse'), 'authenticate-response');
+    assert.equal(observed?.get('x-grok-client-version'), '1.0.3');
+    assert.equal(observed?.get('x-grok-client-identifier'), 'codepilot');
+    assert.equal(observed?.get('x-grok-client-mode'), 'interactive');
+    assert.equal(observed?.get('x-grok-model-override'), 'grok-4.6');
     assert.equal(observed?.get('x-test'), 'keep');
+  });
+
+  it('threads the selected model through the real xAI Responses SDK and Build proxy headers', async () => {
+    manager.saveXaiOAuthTokens({ accessToken: 'fresh-access', expiresAt: Date.now() + 3600_000 });
+    let observedUrl = '';
+    let observedHeaders = new Headers();
+    let observedBody: Record<string, unknown> = {};
+    const wrapped = manager.createXaiOAuthFetch('grok-4.6', (async (input, init) => {
+      observedUrl = typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      observedHeaders = new Headers(init?.headers);
+      observedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return jsonResponse({
+        id: 'resp_oauth_contract',
+        object: 'response',
+        created_at: 1,
+        status: 'completed',
+        error: null,
+        incomplete_details: null,
+        model: 'grok-4.6',
+        output: [{
+          type: 'message',
+          id: 'msg_oauth_contract',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'ok', annotations: [] }],
+        }],
+        usage: {
+          input_tokens: 1,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens: 1,
+          output_tokens_details: { reasoning_tokens: 0 },
+          total_tokens: 2,
+        },
+      });
+    }) as typeof fetch);
+    const xai = createXai({
+      apiKey: 'xai-oauth-placeholder',
+      baseURL: 'https://cli-chat-proxy.grok.com/v1',
+      fetch: wrapped,
+    });
+
+    const result = await generateText({ model: xai.responses('grok-4.6'), prompt: 'synthetic OAuth contract probe' });
+
+    assert.equal(result.text, 'ok');
+    assert.equal(observedUrl, 'https://cli-chat-proxy.grok.com/v1/responses');
+    assert.equal(observedBody.model, 'grok-4.6');
+    assert.equal(observedHeaders.get('x-grok-client-version'), '1.0.3');
+    assert.equal(observedHeaders.get('x-grok-model-override'), observedBody.model);
+    assert.equal(observedHeaders.get('x-authenticateresponse'), 'authenticate-response');
+    assert.equal(observedHeaders.get('x-grok-client-mode'), 'interactive');
   });
 
   it('fetch override preserves Request headers while replacing only authorization', async () => {
     manager.saveXaiOAuthTokens({ accessToken: 'fresh-access', expiresAt: Date.now() + 3600_000 });
-    const request = new Request('https://api.x.ai/v1/responses', {
+    const request = new Request('https://cli-chat-proxy.grok.com/v1/responses', {
       method: 'POST',
       headers: { Authorization: 'Bearer dummy', 'Content-Type': 'application/json', 'x-request': 'keep' },
       body: '{}',
     });
     let observed: Headers | undefined;
-    const wrapped = manager.createXaiOAuthFetch((async (_input, init) => {
+    const wrapped = manager.createXaiOAuthFetch('grok-4.5', (async (_input, init) => {
       observed = new Headers(init?.headers);
       return jsonResponse({ ok: true });
     }) as typeof fetch);
@@ -184,17 +259,108 @@ describe('xAI OAuth manager lifecycle', () => {
     assert.equal(observed?.get('content-type'), 'application/json');
     assert.equal(observed?.get('x-request'), 'keep');
     assert.equal(observed?.get('x-init'), 'override');
+    assert.equal(observed?.get('x-grok-model-override'), 'grok-4.5');
   });
 
   it('fetch override refuses to leak OAuth bearer to a custom gateway', async () => {
     manager.saveXaiOAuthTokens({ accessToken: 'fresh-access', expiresAt: Date.now() + 3600_000 });
     let requests = 0;
-    const wrapped = manager.createXaiOAuthFetch((async () => {
+    const wrapped = manager.createXaiOAuthFetch('grok-4.6', (async () => {
       requests += 1;
       return jsonResponse({});
     }) as typeof fetch);
-    await assert.rejects(() => wrapped('https://gateway.example/v1/responses'), /non-xAI endpoint/);
+    await assert.rejects(() => wrapped('https://gateway.example/v1/responses'), /non-Grok Build endpoint/);
     assert.equal(requests, 0);
+  });
+
+  it('media fetch uses the public Imagine boundary and strips Build-proxy-only headers', async () => {
+    manager.saveXaiOAuthTokens({ accessToken: 'fresh-media-access', expiresAt: Date.now() + 3600_000 });
+    const callerHeaders = new Headers({
+      Authorization: 'Bearer dummy',
+      'X-XAI-Token-Auth': 'should-be-removed',
+      'x-authenticateresponse': 'should-be-removed',
+      'x-grok-client-mode': 'should-be-removed',
+      'x-grok-model-override': 'should-be-removed',
+      'x-test': 'keep',
+    });
+    let observed = new Headers();
+    const wrapped = manager.createXaiOAuthMediaFetch((async (_input, init) => {
+      observed = new Headers(init?.headers);
+      return jsonResponse({ data: [] });
+    }) as typeof fetch);
+
+    await wrapped('https://api.x.ai/v1/images/generations', {
+      method: 'POST',
+      headers: callerHeaders,
+    });
+
+    assert.equal(callerHeaders.get('authorization'), 'Bearer dummy');
+    assert.equal(callerHeaders.get('x-xai-token-auth'), 'should-be-removed');
+    assert.equal(observed.get('authorization'), 'Bearer fresh-media-access');
+    assert.equal(observed.get('x-grok-client-version'), '1.0.3');
+    assert.equal(observed.get('x-grok-client-identifier'), 'codepilot');
+    assert.equal(observed.get('x-xai-token-auth'), null);
+    assert.equal(observed.get('x-authenticateresponse'), null);
+    assert.equal(observed.get('x-grok-client-mode'), null);
+    assert.equal(observed.get('x-grok-model-override'), null);
+    assert.equal(observed.get('x-test'), 'keep');
+  });
+
+  it('media fetch rejects non-Imagine routes before token refresh or upstream I/O', async () => {
+    manager.saveXaiOAuthTokens({
+      accessToken: 'expired-access',
+      refreshToken: 'refresh-secret',
+      expiresAt: Date.now() - 1,
+    });
+    let refreshRequests = 0;
+    let upstreamRequests = 0;
+    globalThis.fetch = (async () => {
+      refreshRequests += 1;
+      return jsonResponse({ access_token: 'rotated', expires_in: 3600 });
+    }) as typeof fetch;
+    const wrapped = manager.createXaiOAuthMediaFetch((async () => {
+      upstreamRequests += 1;
+      return jsonResponse({});
+    }) as typeof fetch);
+
+    await assert.rejects(
+      () => wrapped('https://api.x.ai/v1/models', { method: 'GET' }),
+      /non-Imagine endpoint/,
+    );
+    await assert.rejects(
+      () => wrapped('https://api.x.ai/v1/videos/unsafe%2Fid', { method: 'GET' }),
+      /non-Imagine endpoint/,
+    );
+    assert.equal(refreshRequests, 0);
+    assert.equal(upstreamRequests, 0);
+  });
+
+  it('media fetch refreshes once after a 401 and retries with the rotated bearer', async () => {
+    manager.saveXaiOAuthTokens({
+      accessToken: 'server-rejected-access',
+      refreshToken: 'refresh-secret',
+      expiresAt: Date.now() + 3600_000,
+    });
+    let refreshRequests = 0;
+    globalThis.fetch = (async () => {
+      refreshRequests += 1;
+      return jsonResponse({ access_token: 'rotated-media-access', refresh_token: 'rotated-refresh', expires_in: 3600 });
+    }) as typeof fetch;
+    const seenAuthorization: string[] = [];
+    const wrapped = manager.createXaiOAuthMediaFetch((async (_input, init) => {
+      seenAuthorization.push(new Headers(init?.headers).get('authorization') || '');
+      return seenAuthorization.length === 1 ? jsonResponse({ error: 'unauthorized' }, 401) : jsonResponse({ data: [] });
+    }) as typeof fetch);
+
+    const response = await wrapped('https://api.x.ai/v1/images/generations', { method: 'POST' });
+
+    assert.equal(response.status, 200);
+    assert.equal(refreshRequests, 1);
+    assert.deepEqual(seenAuthorization, [
+      'Bearer server-rejected-access',
+      'Bearer rotated-media-access',
+    ]);
+    assert.equal(manager.readXaiOAuthBundle()?.refreshToken, 'rotated-refresh');
   });
 
   it('refuses a custom gateway before attempting token refresh', async () => {
@@ -204,13 +370,43 @@ describe('xAI OAuth manager lifecycle', () => {
       expiresAt: Date.now() - 1,
     });
     let requests = 0;
-    const wrapped = manager.createXaiOAuthFetch((async () => {
+    const wrapped = manager.createXaiOAuthFetch('grok-4.6', (async () => {
       requests += 1;
       return jsonResponse({});
     }) as typeof fetch);
-    await assert.rejects(() => wrapped('https://gateway.example/v1/responses'), /non-xAI endpoint/);
+    await assert.rejects(() => wrapped('https://gateway.example/v1/responses'), /non-Grok Build endpoint/);
     assert.equal(requests, 0, 'neither refresh nor upstream request may run for a rejected origin');
     assert.equal(manager.readXaiOAuthBundle()?.refreshToken, 'refresh-secret');
+  });
+
+  it('refuses the public API host before refresh because subscription OAuth belongs to the Build proxy', async () => {
+    manager.saveXaiOAuthTokens({
+      accessToken: 'expired-access',
+      refreshToken: 'refresh-secret',
+      expiresAt: Date.now() - 1,
+    });
+    let requests = 0;
+    const wrapped = manager.createXaiOAuthFetch('grok-4.6', (async () => {
+      requests += 1;
+      return jsonResponse({});
+    }) as typeof fetch);
+    await assert.rejects(() => wrapped('https://api.x.ai/v1/responses'), /non-Grok Build endpoint/);
+    assert.equal(requests, 0);
+  });
+
+  it('refuses another path on the Build proxy before refresh', async () => {
+    manager.saveXaiOAuthTokens({
+      accessToken: 'expired-access',
+      refreshToken: 'refresh-secret',
+      expiresAt: Date.now() - 1,
+    });
+    let requests = 0;
+    const wrapped = manager.createXaiOAuthFetch('grok-4.6', (async () => {
+      requests += 1;
+      return jsonResponse({});
+    }) as typeof fetch);
+    await assert.rejects(() => wrapped('https://cli-chat-proxy.grok.com/v1/files'), /non-Grok Build endpoint/);
+    assert.equal(requests, 0);
   });
 
   it('feature switch disables status and credential usability without deleting the bundle', () => {
@@ -227,6 +423,11 @@ describe('xAI OAuth manager lifecycle', () => {
       const authUrl = currentAuthUrl;
       const nonce = new URL(authUrl).searchParams.get('nonce');
       assert.equal(form.get('grant_type'), 'authorization_code');
+      assert.equal(
+        form.get('redirect_uri'),
+        new URL(authUrl).searchParams.get('redirect_uri'),
+        'token exchange must reuse the exact dynamic loopback URI sent to authorize',
+      );
       return jsonResponse({
         access_token: 'browser-access',
         refresh_token: 'browser-refresh',
@@ -239,7 +440,7 @@ describe('xAI OAuth manager lifecycle', () => {
     currentAuthUrl = flow.authUrl;
     const state = new URL(flow.authUrl).searchParams.get('state');
     const response = await originalFetch(
-      `http://127.0.0.1:56121/callback?code=browser-code&state=${state}`,
+      callbackUrl(flow, `?code=browser-code&state=${state}`),
       { headers: { Origin: 'https://auth.x.ai' } },
     );
     assert.equal(response.status, 200);
@@ -266,7 +467,7 @@ describe('xAI OAuth manager lifecycle', () => {
     currentAuthUrl = flow.authUrl;
     const authUrl = new URL(currentAuthUrl);
     const callback = originalFetch(
-      `http://127.0.0.1:56121/callback?code=browser-code&state=${authUrl.searchParams.get('state')}`,
+      callbackUrl(flow, `?code=browser-code&state=${authUrl.searchParams.get('state')}`),
       { headers: { Connection: 'close' } },
     );
     const completionError = flow.completion.catch(error => error as Error);
@@ -291,7 +492,7 @@ describe('xAI OAuth manager lifecycle', () => {
   it('callback HTML escapes provider errors and leaves credentials empty', async () => {
     const flow = await manager.startXaiBrowserFlow();
     const rejection = flow.completion.catch(error => error as Error);
-    const response = await originalFetch('http://127.0.0.1:56121/callback?error=access_denied&error_description=%3Cscript%3Ebad%3C%2Fscript%3E');
+    const response = await originalFetch(callbackUrl(flow, '?error=access_denied&error_description=%3Cscript%3Ebad%3C%2Fscript%3E'));
     const html = await response.text();
     assert.doesNotMatch(html, /<script>bad<\/script>/);
     assert.match(html, /&lt;script&gt;bad&lt;\/script&gt;/);
@@ -304,13 +505,13 @@ describe('xAI OAuth manager lifecycle', () => {
   it('callback server rejects untrusted CORS origins and supports approved private-network preflight', async () => {
     const flow = await manager.startXaiBrowserFlow();
     const completion = flow.completion.catch(() => undefined);
-    const rejected = await originalFetch('http://127.0.0.1:56121/callback', {
+    const rejected = await originalFetch(callbackUrl(flow), {
       method: 'OPTIONS',
       headers: { Origin: 'https://attacker.example' },
     });
     assert.equal(rejected.status, 403);
 
-    const approved = await originalFetch('http://127.0.0.1:56121/callback', {
+    const approved = await originalFetch(callbackUrl(flow), {
       method: 'OPTIONS',
       headers: {
         Origin: 'https://auth.x.ai',
@@ -324,14 +525,20 @@ describe('xAI OAuth manager lifecycle', () => {
     await completion;
   });
 
-  it('reports fixed callback port occupation with device-code guidance', async () => {
+  it('uses a dynamic callback port even when the old fixed port is occupied', async () => {
     const blocker = http.createServer((_req, res) => res.end('occupied'));
     await new Promise<void>((resolve, reject) => {
       blocker.once('error', reject);
       blocker.listen(56121, '127.0.0.1', resolve);
     });
     try {
-      await assert.rejects(() => manager.startXaiBrowserFlow(), /already in use.*device-code/i);
+      const flow = await manager.startXaiBrowserFlow();
+      const completion = flow.completion.catch(() => undefined);
+      const redirectUri = new URL(flow.authUrl).searchParams.get('redirect_uri');
+      assert.ok(redirectUri);
+      assert.notEqual(new URL(redirectUri).port, '56121');
+      await manager.cancelXaiOAuthFlow();
+      await completion;
     } finally {
       await new Promise<void>(resolve => blocker.close(() => resolve()));
     }
@@ -348,7 +555,7 @@ describe('xAI OAuth manager lifecycle', () => {
   it('virtual provider resolves to xAI Responses without a DB row', async () => {
     manager.saveXaiOAuthTokens({ accessToken: 'fresh-access', expiresAt: Date.now() + 3600_000 });
     const { resolveProvider, toAiSdkConfig } = await import('../../lib/provider-resolver');
-    const resolved = resolveProvider({ providerId: 'xai-oauth', callScene: 'interactive_chat', model: 'grok-4.5' });
+    const resolved = resolveProvider({ providerId: 'xai-oauth', callScene: 'interactive_chat', model: 'grok-4.6' });
     assert.equal(resolved._xaiOAuth, true);
     assert.equal(resolved.provider, undefined);
     assert.equal(resolved.protocol, 'xai');
@@ -356,8 +563,8 @@ describe('xAI OAuth manager lifecycle', () => {
       sdkType: 'xai',
       apiKey: undefined,
       authToken: undefined,
-      baseUrl: 'https://api.x.ai/v1',
-      modelId: 'grok-4.5',
+      baseUrl: 'https://cli-chat-proxy.grok.com/v1',
+      modelId: 'grok-4.6',
       headers: {},
       processEnvInjections: {},
       useXaiOAuth: true,

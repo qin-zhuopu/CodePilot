@@ -382,9 +382,9 @@ function createLanguageModel(config: AiSdkConfig, isThirdPartyProxy: boolean): L
         apiKey: config.useXaiOAuth ? 'xai-oauth' : config.apiKey,
         baseURL: config.baseUrl || 'https://api.x.ai/v1',
         ...(hasHeaders ? { headers: config.headers } : {}),
-        ...(config.useXaiOAuth ? { fetch: createXaiOAuthFetch() } : {}),
+        ...(config.useXaiOAuth ? { fetch: createXaiOAuthFetch(config.modelId) } : {}),
       });
-      // Grok 4.5 is intentionally wired through xAI Responses, not the
+      // Grok 4.5+ is intentionally wired through xAI Responses, not the
       // provider's OpenAI-compatible Chat Completions surface.
       return xai.responses(config.modelId);
     }

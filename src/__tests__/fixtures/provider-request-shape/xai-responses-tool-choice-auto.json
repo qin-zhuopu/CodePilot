@@ -14,7 +14,7 @@
       "user-agent": "ai/7.0.11 ai-sdk/provider-utils/5.0.12 runtime/node.js/22"
     },
     "body": {
-      "model": "grok-4.5",
+      "model": "grok-4.6",
       "input": [
         {
           "role": "system",

@@ -51,7 +51,7 @@ describe('managed virtual providers share picker and Sub-agent route discovery',
     );
   });
 
-  it('exposes authenticated xAI OAuth Grok 4.5 to CodePilot and Codex Sub-agents', async () => {
+  it('exposes authenticated Grok Build OAuth with Grok 4.6 first to CodePilot and Codex Sub-agents', async () => {
     setSetting('xai_oauth_bundle', JSON.stringify({
       accessToken: 'xai-test-token-never-send',
       refreshToken: 'xai-test-refresh-never-send',
@@ -65,7 +65,7 @@ describe('managed virtual providers share picker and Sub-agent route discovery',
     assert.ok(virtual);
     assert.deepEqual(
       virtual.models.map(model => model.modelId),
-      ['grok-4.5'],
+      ['grok-4.6', 'grok-4.5'],
     );
     assert.equal(virtual.compat, 'codepilot_only');
     assert.equal(virtual.protocol, 'xai');
@@ -81,13 +81,13 @@ describe('managed virtual providers share picker and Sub-agent route discovery',
     for (const runtime of ['codepilot_runtime', 'codex_runtime'] as const) {
       const route = listSubagentRoutes(runtime).find(
         candidate => candidate.providerId === 'xai-oauth'
-          && candidate.id === 'grok-4.5',
+          && candidate.id === 'grok-4.6',
       );
       assert.ok(route, `${runtime} must expose authenticated xAI OAuth Grok`);
-      assert.equal(route.displayName, 'Grok 4.5');
+      assert.equal(route.displayName, 'Grok 4.6');
       assert.match(
         getSubagentRoutingGuidance(runtime, [route]),
-        /provider_id="xai-oauth", model="grok-4\.5"/,
+        /provider_id="xai-oauth", model="grok-4\.6"/,
       );
     }
 
@@ -102,7 +102,7 @@ describe('managed virtual providers share picker and Sub-agent route discovery',
     };
     const pickerGroup = data.groups.find(group => group.provider_id === 'xai-oauth');
     assert.ok(pickerGroup, 'the picker and Sub-agent catalog must share xAI OAuth availability');
-    assert.equal(pickerGroup.models[0]?.value, 'grok-4.5');
+    assert.equal(pickerGroup.models[0]?.value, 'grok-4.6');
     assert.ok(pickerGroup.models[0]?.supportedRuntimes?.includes('codepilot_runtime'));
 
     assert.equal(

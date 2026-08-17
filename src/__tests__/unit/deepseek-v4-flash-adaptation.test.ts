@@ -1,5 +1,5 @@
 /**
- * DeepSeek V4 Flash 0731 adaptation contract.
+ * DeepSeek V4 Flash 0731 + V4 Pro 0813 adaptation contract.
  *
  * Pins the distinction between first-party DeepSeek and aggregators that list
  * the same model: only the first-party preset owns verified effort and native
@@ -31,6 +31,7 @@ import { normalizeModelCapabilitySurface } from '../../app/api/providers/models/
 
 const DEEPSEEK_BASE = 'https://api.deepseek.com/anthropic';
 const FLASH = 'deepseek-v4-flash';
+const PRO = 'deepseek-v4-pro';
 const FAKE_KEY = 'deepseek-test-key-not-real';
 
 function resolvedDeepSeek(modelId = FLASH): ResolvedProvider {
@@ -59,7 +60,7 @@ function resolvedDeepSeek(modelId = FLASH): ResolvedProvider {
   };
 }
 
-function completedResponsesPayload(): Record<string, unknown> {
+function completedResponsesPayload(model = FLASH): Record<string, unknown> {
   return {
     id: 'resp_deepseek_fixture',
     object: 'response',
@@ -67,7 +68,7 @@ function completedResponsesPayload(): Record<string, unknown> {
     status: 'completed',
     error: null,
     incomplete_details: null,
-    model: FLASH,
+    model,
     output: [{
       type: 'message',
       id: 'msg_deepseek_fixture',
@@ -106,6 +107,17 @@ describe('DeepSeek catalog + identity boundary', () => {
     });
     assert.equal(apiSurface.contextWindow, 1_048_576);
     assert.deepEqual(apiSurface.supportedEffortLevels, ['low', 'high', 'max']);
+
+    const pro = preset.defaultModels.find(model => model.modelId === PRO);
+    assert.ok(pro);
+    assert.equal(pro.displayName, 'DeepSeek V4 Pro');
+    assert.equal(pro.upstreamModelId, PRO, '0813 is a server-side version, not a new API id');
+    assert.equal(pro.capabilities?.contextWindow, 1_048_576);
+    assert.deepEqual(pro.capabilities?.supportedEffortLevels, ['low', 'high', 'max']);
+
+    const pro1m = preset.defaultModels.find(model => model.modelId === `${PRO}[1m]`);
+    assert.ok(pro1m);
+    assert.equal(pro1m.displayName, 'DeepSeek V4 Pro (1M)');
   });
 
   it('keeps ClinePass and OpenCode Go DeepSeek entries tool-use-only', () => {
@@ -135,9 +147,17 @@ describe('DeepSeek catalog + identity boundary', () => {
       provider_type: 'anthropic',
       protocol: 'anthropic',
       base_url: DEEPSEEK_BASE,
-    }, 'deepseek-v4-pro');
-    assert.deepEqual(directPro.anthropicEffortLevels, ['high', 'max']);
-    assert.equal(directPro.codexResponses, undefined);
+    }, PRO);
+    assert.deepEqual(directPro.anthropicEffortLevels, ['low', 'high', 'max']);
+    assert.equal(directPro.codexResponses?.baseUrl, 'https://api.deepseek.com');
+
+    const claudeAlias = getVerifiedProviderWireCapabilities({
+      preset_key: 'deepseek',
+      provider_type: 'anthropic',
+      protocol: 'anthropic',
+      base_url: DEEPSEEK_BASE,
+    }, 'deepseek-v4-pro[1m]');
+    assert.equal(claudeAlias.codexResponses, undefined, 'Responses uses the stable non-suffixed API id');
 
     const aggregator = getVerifiedProviderWireCapabilities({
       preset_key: 'cline-pass',
@@ -188,7 +208,7 @@ describe('DeepSeek runtime transport selection', () => {
     assert.equal(customizedResolved.envOverrides.CLAUDE_CODE_SUBAGENT_MODEL, 'my-flash-alias');
   });
 
-  it('uses native Responses only for Flash under Codex Runtime', () => {
+  it('uses native Responses for Flash and the stable Pro id under Codex Runtime', () => {
     const flashCodex = toAiSdkConfig(resolvedDeepSeek(), FLASH, { runtime: 'codex_runtime' });
     assert.equal(flashCodex.sdkType, 'openai');
     assert.equal(flashCodex.baseUrl, 'https://api.deepseek.com');
@@ -201,15 +221,28 @@ describe('DeepSeek runtime transport selection', () => {
     assert.equal(flashNative.baseUrl, DEEPSEEK_BASE);
 
     const proCodex = toAiSdkConfig(
-      resolvedDeepSeek('deepseek-v4-pro'),
-      'deepseek-v4-pro',
+      resolvedDeepSeek(PRO),
+      PRO,
       { runtime: 'codex_runtime' },
     );
-    assert.equal(proCodex.sdkType, 'claude-code-compat');
-    assert.equal(proCodex.useResponsesApi, undefined);
+    assert.equal(proCodex.sdkType, 'openai');
+    assert.equal(proCodex.baseUrl, 'https://api.deepseek.com');
+    assert.equal(proCodex.useResponsesApi, true);
+    assert.deepEqual(proCodex.verifiedResponsesEffortLevels, ['low', 'high', 'max']);
+
+    const proNative = toAiSdkConfig(resolvedDeepSeek(PRO), PRO, { runtime: 'codepilot_runtime' });
+    assert.equal(proNative.sdkType, 'claude-code-compat');
+
+    const proClaudeAlias = toAiSdkConfig(
+      resolvedDeepSeek('deepseek-v4-pro[1m]'),
+      'deepseek-v4-pro[1m]',
+      { runtime: 'codex_runtime' },
+    );
+    assert.equal(proClaudeAlias.sdkType, 'claude-code-compat');
+    assert.equal(proClaudeAlias.useResponsesApi, undefined);
   });
 
-  it('production Responses factory sends /responses, bearer auth, and max effort', async () => {
+  it('production Responses factory sends Pro 0813 through /responses with bearer auth and max effort', async () => {
     let capturedUrl = '';
     let capturedAuth = '';
     let capturedBody: Record<string, unknown> = {};
@@ -221,7 +254,7 @@ describe('DeepSeek runtime transport selection', () => {
           : input.url;
       capturedAuth = new Headers(init?.headers).get('authorization') ?? '';
       capturedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
-      return new Response(JSON.stringify(completedResponsesPayload()), {
+      return new Response(JSON.stringify(completedResponsesPayload(PRO)), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -230,7 +263,7 @@ describe('DeepSeek runtime transport selection', () => {
     const model = createApiKeyResponsesLanguageModel({
       apiKey: FAKE_KEY,
       baseUrl: 'https://api.deepseek.com',
-      modelId: FLASH,
+      modelId: PRO,
       headers: {},
       supportsResponsesReasoningSummary: false,
     }, captureFetch);
@@ -245,7 +278,7 @@ describe('DeepSeek runtime transport selection', () => {
     assert.equal(result.text, 'ok');
     assert.equal(capturedUrl, 'https://api.deepseek.com/responses');
     assert.equal(capturedAuth, `Bearer ${FAKE_KEY}`);
-    assert.equal(capturedBody.model, FLASH);
+    assert.equal(capturedBody.model, PRO);
     assert.deepEqual(capturedBody.reasoning, { effort: 'max' });
   });
 });
@@ -294,6 +327,7 @@ describe('DeepSeek effort wire formats', () => {
     const context = {
       responses: {
         verifiedEffortLevels: ['low', 'high', 'max'] as const,
+        effortAliases: { xhigh: 'high' } as const,
       },
     };
     const max = buildProviderOptions({

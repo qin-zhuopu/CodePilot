@@ -156,6 +156,51 @@ function MarkdownLink({
   );
 }
 
+/**
+ * Models should normally return structured `tool_result.media`, but older or
+ * interrupted tool flows may leave a Markdown image pointing at the absolute
+ * local file in CodePilot's managed media directory. Browsers cannot load that
+ * filesystem path directly. Route only those managed paths through the
+ * existing allowlisted media endpoint; every other URL remains untouched.
+ */
+export function resolveMarkdownImageSrc(
+  src?: ComponentProps<"img">["src"],
+): ComponentProps<"img">["src"] {
+  if (typeof src !== "string" || !src) return src;
+
+  let candidate = src;
+  if (/^file:\/\//i.test(candidate)) {
+    try {
+      const parsed = new URL(candidate);
+      candidate = decodeURIComponent(parsed.pathname);
+      // file:///C:/... is represented with a leading slash by URL.
+      if (/^\/[a-z]:\//i.test(candidate)) candidate = candidate.slice(1);
+    } catch {
+      return src;
+    }
+  }
+
+  const normalized = candidate.replace(/\\/g, "/");
+  const absolute = normalized.startsWith("/") || /^[a-z]:\//i.test(normalized);
+  const managedMediaPath = /(^|\/)\.codepilot-media(?:\/|$)/.test(normalized);
+  if (!absolute || !managedMediaPath) return src;
+
+  return `/api/media/serve?path=${encodeURIComponent(candidate)}`;
+}
+
+function MarkdownImage({ src, ...props }: ComponentProps<"img">) {
+  return (
+    // eslint-disable-next-line @next/next/no-img-element -- Markdown sources can reference arbitrary URLs.
+    <img
+      {...props}
+      alt={props.alt ?? ""}
+      src={resolveMarkdownImageSrc(src)}
+      className={cn("my-3 max-w-full rounded-lg border border-border/40", props.className)}
+      loading={props.loading ?? "lazy"}
+    />
+  );
+}
+
 export const BASE_MARKDOWN_COMPONENTS = {
   h1: (props: ComponentProps<"h1">) => (
     <h1 className="mb-3 mt-6 text-2xl font-semibold tracking-tight" {...props} />
@@ -194,14 +239,7 @@ export const BASE_MARKDOWN_COMPONENTS = {
   strong: (props: ComponentProps<"strong">) => (
     <strong className="font-semibold text-foreground" {...props} />
   ),
-  img: (props: ComponentProps<"img">) => (
-    // eslint-disable-next-line @next/next/no-img-element -- Markdown sources can reference arbitrary URLs.
-    <img
-      className="my-3 max-w-full rounded-lg border border-border/40"
-      loading="lazy"
-      {...props}
-    />
-  ),
+  img: MarkdownImage,
   table: MarkdownTable,
   thead: MarkdownTHead,
   tbody: MarkdownTBody,

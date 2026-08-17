@@ -9,7 +9,7 @@
 - Qwen Personal 与 Team 共用地址，URL 无法说明用户买了哪个套餐。
 - Coding Plan、Token Plan Personal、Token Plan Team 的模型目录不同，错误匹配会把套餐配置成另一套产品。
 - 套餐凭据若被后台任务使用，用户既看不到调用，也可能违反套餐的交互使用边界。
-- xAI API Key 与 SuperGrok 订阅登录是两种不同的凭据和风险模型，不能包装成一个模糊的“Grok 登录”。
+- xAI API Key 与 Grok Build 订阅 OAuth（历史 smoke 使用 SuperGrok 账号）是两种不同的凭据和风险模型，不能包装成一个模糊的“Grok 登录”。
 
 因此产品目标是让“用户选择的产品身份”贯穿配置、模型列表、Runtime 与实际请求，而不是只让连接测试返回成功。
 
@@ -29,7 +29,7 @@ URL 是传输配置，不是产品身份。把 `preset_key` 持久化后，用�
 
 ## 为什么 xAI 保留两条渠道
 
-官方 API Key 是稳定、按 API 账户计费的路径；SuperGrok OAuth 是订阅用户更自然的体验，但 CodePilot 当前复用公开 Grok CLI client，受上游 allowlist、redirect 和政策调整影响。
+官方 API Key 是稳定、按 API 账户计费的路径；Grok Build OAuth 是订阅用户更自然的体验，但 CodePilot 当前复用公开 Grok Build client，受上游 allowlist、redirect 和政策调整影响。
 
 把两条路径并列有三个好处：
 
@@ -44,6 +44,14 @@ URL 是传输配置，不是产品身份。把 `preset_key` 持久化后，用�
 Grok 的文本推理、CodePilot 客户端函数工具和 xAI 托管 X Search 是三层不同事实。模型返回文本只能证明 Responses 调用成功；文件/Shell 工具工作只能证明 CodePilot 的 client tools 接线成功；只有请求真实携带 `x_search`、上游返回 provider-executed lifecycle 与 X citation，才能证明本轮使用了 X Search。
 
 因此产品不做静默能力猜测：API Key 与 OAuth 共用同一 hosted-tool 接线，但四个 Runtime/凭据组合仍分别真实验收。搜索结果按不可信外部数据处理，来源进入消息持久化；403 只说明上游拒绝访问，不能仅凭状态码把原因写死为订阅 entitlement。费用也不按调用次数在客户端猜算，只有上游真实 usage/账单事实才可显示。
+
+## 为什么 Grok Imagine 不放进聊天模型列表
+
+Grok Build 的账号目录与媒体能力是两类产品表面：authenticated `/v1/models` 回答“这个订阅账号可以把聊天路由到哪些文本/agent 模型”，而 `image_gen`、`image_edit`、`image_to_video`、`reference_to_video` 是聊天中触发的工具。把 Imagine slug 塞进聊天模型 picker，会让用户误以为选中后仍能进行普通多轮对话，也绕开现有媒体结果的 Gallery/lineage 合同。
+
+因此产品入口应保持简单：聊天 picker 只显示账号目录返回的可对话模型；用户在聊天中提出生成/编辑图片或制作视频时，由 Grok Build 工具产出 `MediaBlock` 并进入 Gallery。OAuth 传输也分开守边界——文本推理与目录走 Build proxy，图片/视频只经精确媒体路径直连公共 API；不能因为两者使用同一登录态就放宽成任意 `api.x.ai` 请求。
+
+还有一个更基础的语义门禁：Build proxy 通过 `x-grok-model-override` 决定真实文本后端。若 UI 显示 4.6、请求却不发 override，实际可能仍走默认 `grok-build`；连接成功也不能算选中模型已生效。产品必须同时核对 picker 选择、请求 header 与响应模型，才允许显示为可用。
 
 ## 用户反馈改变了什么
 
@@ -64,5 +72,6 @@ Grok 的文本推理、CodePilot 客户端函数工具和 xAI 托管 X Search �
 - OAuth bundle 尚未迁移到 OS keyring，沿用项目现有 settings 存储边界。
 - 配额、套餐名称和剩余额度没有可靠 API 来源，因此界面不展示猜测值。
 - device、refresh/tool/logout、Windows packaged 登录、其他浏览器及部分 Qwen 套餐还需要继续真实 smoke。
+- Grok Build 的 `x-grok-model-override` 与 Imagine 图像/视频工具已经实现并通过自动化合同；账号模型目录仍是静态 fallback，Imagine entitlement/计费和真实媒体输出尚未完成真实凭据 smoke。
 
 后续优先方向是申请 CodePilot 自有 public OAuth client、统一凭据加密，并把真实 smoke 变成每个发布版本可重复执行的外部验收清单。

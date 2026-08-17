@@ -12,8 +12,9 @@ describe('xAI dual-channel Settings contract', () => {
   it('keeps API Key and OAuth as distinct user-visible entries', () => {
     assert.match(source, /OFFICIAL_DIRECT_API_KEYS[\s\S]*'xai'/);
     assert.match(source, /key:\s*'xai-oauth'/);
-    assert.match(source, /name:\s*'xAI Grok OAuth'/);
+    assert.match(source, /name:\s*'Grok Build OAuth'/);
     assert.match(source, /API Key remains available/);
+    assert.match(source, /public Grok Build OAuth client/);
   });
 
   it('offers browser and device-code as methods of one OAuth identity', () => {
@@ -50,6 +51,14 @@ describe('xAI dual-channel Settings contract', () => {
     );
     assert.doesNotMatch(xaiCard, /quota|remaining|percentage|\bPro\b|\bPremium\b/i);
     assert.match(xaiCard, /Billing source/);
+  });
+
+  it('surfaces the OAuth entitlement in Image & video providers and wires it to the image default', () => {
+    assert.match(source, /provider\.mediaProviders/);
+    assert.match(source, /Grok Imagine Image 2\.0/);
+    assert.match(source, /Grok Imagine Video 1\.5/);
+    assert.match(source, /setActiveImageProvider\('xai-oauth'\)/);
+    assert.match(source, /xaiAuth\?\.usable/);
   });
 
   it('cancels both server flow and UI polling when the dialog closes', () => {

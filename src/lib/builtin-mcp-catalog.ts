@@ -65,7 +65,7 @@ export const BUILTIN_MCP_CATALOG: readonly BuiltInMcpEntry[] = [
   {
     name: "codepilot-image-gen",
     descriptionKey: "mcp.builtin.imageGen.description",
-    toolNames: ["codepilot_generate_image"],
+    toolNames: ["codepilot_generate_image", "codepilot_generate_video"],
     triggerCondition: "keyword",
     triggerHintKey: "mcp.builtin.imageGen.triggerHint",
   },

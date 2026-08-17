@@ -28,6 +28,7 @@ import {
 import { POST as providersPOST } from '../../app/api/providers/route';
 import { PUT as providerPUT } from '../../app/api/providers/[id]/route';
 import { GET as activeImageGET, PUT as activeImagePUT } from '../../app/api/providers/active-image/route';
+import { XAI_OAUTH_BUNDLE_SETTING } from '../../lib/xai-oauth-manager';
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -129,15 +130,24 @@ describe('PUT /api/providers/[id] — MEDIA_BASE_URL_REQUIRED', () => {
 
 describe('/api/providers/active-image — stale detection', () => {
   let originalActive: string;
+  let originalXaiBundle: string;
+  let originalXaiEnabled: string | undefined;
 
   beforeEach(() => {
     originalActive = getSetting('active_image_provider_id') || '';
+    originalXaiBundle = getSetting(XAI_OAUTH_BUNDLE_SETTING) || '';
+    originalXaiEnabled = process.env.CODEPILOT_XAI_OAUTH_ENABLED;
+    process.env.CODEPILOT_XAI_OAUTH_ENABLED = '1';
     setSetting('active_image_provider_id', '');
+    setSetting(XAI_OAUTH_BUNDLE_SETTING, '');
   });
 
   afterEach(() => {
     cleanupTestRows();
     setSetting('active_image_provider_id', originalActive);
+    setSetting(XAI_OAUTH_BUNDLE_SETTING, originalXaiBundle);
+    if (originalXaiEnabled === undefined) delete process.env.CODEPILOT_XAI_OAUTH_ENABLED;
+    else process.env.CODEPILOT_XAI_OAUTH_ENABLED = originalXaiEnabled;
   });
 
   it('reports stale=true when the active row is edited to a non-media type', async () => {
@@ -232,5 +242,62 @@ describe('/api/providers/active-image — stale detection', () => {
     assert.equal(putRes.status, 400);
     const body = await putRes.json();
     assert.equal(body.code, 'MISSING_API_KEY');
+  });
+
+  it('accepts usable Grok Build OAuth as a virtual image provider and returns official media metadata', async () => {
+    setSetting(XAI_OAUTH_BUNDLE_SETTING, JSON.stringify({
+      accessToken: 'test-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      email: 'media@example.com',
+      updatedAt: Date.now(),
+    }));
+
+    const putRes = await activeImagePUT(
+      jsonReq('http://localhost/api/providers/active-image', 'PUT', { providerId: 'xai-oauth' }),
+    );
+    assert.equal(putRes.status, 200);
+    assert.equal(getSetting('active_image_provider_id'), 'xai-oauth');
+
+    const getRes = await activeImageGET();
+    const body = await getRes.json();
+    assert.deepEqual(
+      {
+        providerId: body.providerId,
+        stale: body.stale,
+        providerName: body.providerName,
+        providerType: body.providerType,
+        family: body.family,
+        model: body.model,
+        modelLabel: body.modelLabel,
+        videoModel: body.videoModel,
+        videoModelLabel: body.videoModelLabel,
+      },
+      {
+        providerId: 'xai-oauth',
+        stale: false,
+        providerName: 'Grok Build',
+        providerType: 'xai-oauth',
+        family: 'xai',
+        model: 'grok-imagine-image-2.0',
+        modelLabel: 'Grok Imagine Image 2.0',
+        videoModel: 'grok-imagine-video-1.5',
+        videoModelLabel: 'Grok Imagine Video 1.5',
+      },
+    );
+  });
+
+  it('rejects Grok Build as the default when OAuth is missing and marks a stored choice stale', async () => {
+    const putRes = await activeImagePUT(
+      jsonReq('http://localhost/api/providers/active-image', 'PUT', { providerId: 'xai-oauth' }),
+    );
+    assert.equal(putRes.status, 401);
+    assert.equal((await putRes.json()).code, 'GROK_BUILD_OAUTH_REQUIRED');
+
+    setSetting('active_image_provider_id', 'xai-oauth');
+    const getRes = await activeImageGET();
+    const body = await getRes.json();
+    assert.equal(body.providerId, 'xai-oauth');
+    assert.equal(body.stale, true);
+    assert.equal(body.providerType, 'xai-oauth');
   });
 });

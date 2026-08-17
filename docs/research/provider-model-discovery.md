@@ -190,8 +190,8 @@
 | 阿里云百炼 Coding Plan | `bailian` | `https://help.aliyun.com/zh/model-studio/coding-plan`；2026-07-21 核对 | 10 个：`qwen3.7-plus` / `qwen3.6-plus` / `qwen3.5-plus` / `qwen3-max-2026-01-23` / `qwen3-coder-next` / `qwen3-coder-plus` / `kimi-k2.5` / `glm-5` / `glm-4.7` / `MiniMax-M2.5` | ✓ 套餐型 | ✓ |
 | 千问 Token Plan 个人版 | `qwen-token-plan-personal-cn` | `https://platform.qianwenai.com/docs/token-plan/personal/token-plan-personal-overview`；2026-07-21 核对 | 6 个：`qwen3.8-max-preview` / `qwen3.7-max` / `qwen3.7-plus` / `qwen3.6-flash` / `glm-5.2` / `deepseek-v4-pro` | ✓ 套餐型 | ✓ |
 | 千问 Token Plan 团队版 | `bailian-token-plan-cn` | `https://platform.qianwenai.com/docs/token-plan/team/token-plan-team-overview`；2026-07-21 核对 | 15 个：`qwen3.8-max-preview` / `qwen3.7-max` / `qwen3.7-plus` / `qwen3.6-plus` / `qwen3.6-flash` / `deepseek-v4-pro` / `deepseek-v4-flash` / `deepseek-v3.2` / `kimi-k2.7-code` / `kimi-k2.6` / `kimi-k2.5` / `glm-5.2` / `glm-5.1` / `glm-5` / `MiniMax-M2.5` | ✓ 套餐型 | ✓ |
-| 智谱 GLM Coding Plan（CN） | `glm-cn` | docs.bigmodel.cn/cn/coding-plan/tool/claude / bigmodel.cn API Keys | 3 alias：sonnet→GLM-5-Turbo, opus→GLM-5.1, haiku→GLM-4.5-Air | ✓ 套餐型 | ✓ |
-| 智谱 GLM Coding Plan（Global） | `glm-global` | docs.z.ai/devpack/tool/claude / z.ai apikey | 同 GLM CN | ✓ 套餐型 | ✓ |
+| 智谱 GLM Coding Plan（CN） | `glm-cn` | docs.bigmodel.cn/cn/coding-plan/latest-model / tool/claude / tool/codex（2026-08-14 核对） | 3 个：sonnet→GLM-5.3 `[1m]`、GLM-5-Turbo、haiku→GLM-4.7；Codex 对 5.3 使用 bare ID | ✓ 套餐型 | ✓ |
+| 智谱 GLM Coding Plan（Global） | `glm-global` | docs.z.ai/devpack/latest-model / tool/claude / tool/codex（2026-08-14 核对） | 同 GLM CN，使用 Global endpoints | ✓ 套餐型 | ✓ |
 | MiniMax Coding（CN） | `minimax-cn` | platform.minimaxi.com / agent.minimaxi.com | 1 SKU：`MiniMax-M2.7` | ✓ 套餐型 | ✓ |
 | MiniMax Coding（Global） | `minimax-global` | minimax.io | 1 SKU：`MiniMax-M2.7` | ✓ 套餐型 | ✓ |
 | 小米 MiMo Token Plan | `xiaomi-mimo-token-plan` | xiaomimimo.com / token-plan-cn 文档 | 1 SKU：`MiMo-V2-Pro` | ✓ 套餐型 | ✓ |

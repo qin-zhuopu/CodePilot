@@ -4297,6 +4297,161 @@ export function seedCatalogModelsIfEmpty(
   return catalogModels.length;
 }
 
+/**
+ * Merge the current catalog into an existing catalog-only provider without
+ * turning a Models-page read into a destructive "align everything" action.
+ *
+ * Vendor plan catalogs evolve after a provider has already been materialized
+ * in SQLite (for example `sonnet / GLM-5.2` became
+ * `sonnet / GLM-5.3[1m]`). `seedCatalogModelsIfEmpty()` cannot help those
+ * installations because the provider already has rows, while the full
+ * `alignEnabledWithCatalog()` operation may disable/prune non-catalog rows and
+ * therefore remains preview-first.
+ *
+ * This narrower upgrade path is safe to run when Settings > Models reads a
+ * catalog-only plan provider:
+ *   - update metadata/order only for pristine `source='catalog'` rows;
+ *   - insert catalog ids that do not exist yet;
+ *   - never touch a manual/user-edited/manual-hidden row;
+ *   - never disable or delete rows that disappeared from the catalog.
+ */
+export function mergeCatalogManagedModels(
+  providerId: string,
+  catalogModels: CatalogSyncModel[],
+): { inserted: number; updated: number } {
+  if (catalogModels.length === 0) return { inserted: 0, updated: 0 };
+
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT model_id, upstream_model_id, display_name, capabilities_json,
+            sort_order, source, user_edited, enable_source
+     FROM provider_models
+     WHERE provider_id = ?`,
+  ).all(providerId) as Array<{
+    model_id: string;
+    upstream_model_id: string;
+    display_name: string;
+    capabilities_json: string | null;
+    sort_order: number;
+    source: import('@/types').ProviderModelSource;
+    user_edited: number;
+    enable_source: import('@/types').ModelEnableSource;
+  }>;
+  const rowsById = new Map(rows.map(row => [row.model_id, row]));
+  const rowsByUpstream = new Map(rows.map(row => [row.upstream_model_id, row]));
+  const now = new Date().toISOString().replace('T', ' ').split('.')[0];
+  const insertStmt = db.prepare(
+    `INSERT OR IGNORE INTO provider_models (id, provider_id, model_id, upstream_model_id, display_name, capabilities_json, variants_json, sort_order, enabled, created_at, source, last_refreshed_at, user_edited, enable_source)
+     SELECT ?, ?, ?, ?, ?, ?, '{}', ?, 1, ?, 'catalog', NULL, 0, 'catalog'
+     WHERE NOT EXISTS (
+       SELECT 1 FROM provider_models
+       WHERE provider_id = ? AND (model_id = ? OR upstream_model_id = ?)
+     )`,
+  );
+  const updateStmt = db.prepare(
+    `UPDATE provider_models
+     SET upstream_model_id = ?, display_name = ?,
+         capabilities_json = COALESCE(?, capabilities_json), sort_order = ?
+     WHERE provider_id = ? AND model_id = ?
+       AND source = 'catalog' AND user_edited = 0
+       AND enable_source NOT IN ('manual_enabled', 'manual_hidden')`,
+  );
+
+  const isCatalogManaged = (row: (typeof rows)[number]) => row.source === 'catalog'
+    && row.user_edited === 0
+    && row.enable_source !== 'manual_enabled'
+    && row.enable_source !== 'manual_hidden';
+
+  // Catalog rows are movable, but every row outside that narrow ownership
+  // boundary keeps its exact order. Allocate around those reserved slots so
+  // adding a new catalog SKU never ties a user-pinned/manual row.
+  const catalogIds = new Set(catalogModels.map(model => model.modelId));
+  const movableCatalogIds = new Set(
+    rows
+      .filter(row => catalogIds.has(row.model_id) && isCatalogManaged(row))
+      .map(row => row.model_id),
+  );
+  const reservedSortOrders = new Set(
+    rows
+      .filter(row => !movableCatalogIds.has(row.model_id))
+      .map(row => row.sort_order),
+  );
+  const claimedModelIds = new Set<string>();
+  const claimedUpstreamIds = new Set(rowsByUpstream.keys());
+  const targetSortOrders = new Map<string, number>();
+  catalogModels.forEach((model, index) => {
+    if (claimedModelIds.has(model.modelId)) return;
+    const upstreamModelId = model.upstreamModelId || model.modelId;
+    const existing = rowsById.get(model.modelId);
+    if (existing && !isCatalogManaged(existing)) return;
+    if (!existing && claimedUpstreamIds.has(upstreamModelId)) return;
+
+    let targetSortOrder = index;
+    while (reservedSortOrders.has(targetSortOrder)) targetSortOrder++;
+    targetSortOrders.set(model.modelId, targetSortOrder);
+    reservedSortOrders.add(targetSortOrder);
+    claimedModelIds.add(model.modelId);
+    claimedUpstreamIds.add(upstreamModelId);
+  });
+
+  let inserted = 0;
+  let updated = 0;
+  const txn = db.transaction(() => {
+    catalogModels.forEach((model) => {
+      const upstreamModelId = model.upstreamModelId || model.modelId;
+      const displayName = model.displayName || model.modelId;
+      const capabilitiesJson = serializeCatalogCapabilities(model);
+      const existing = rowsById.get(model.modelId);
+      const targetSortOrder = targetSortOrders.get(model.modelId);
+
+      // A user-owned row may use the vendor's wire id directly instead of the
+      // catalog's stable alias. It already represents this SKU, so inserting a
+      // second enabled row would create two picker entries for one upstream.
+      if (targetSortOrder === undefined) return;
+
+      if (!existing) {
+        const result = insertStmt.run(
+          crypto.randomBytes(16).toString('hex'),
+          providerId,
+          model.modelId,
+          upstreamModelId,
+          displayName,
+          capabilitiesJson ?? '{}',
+          targetSortOrder,
+          now,
+          providerId,
+          model.modelId,
+          upstreamModelId,
+        );
+        // INSERT OR IGNORE closes the cross-process window between the
+        // snapshot above and this write. Count only the row this transaction
+        // actually won; a concurrent winner remains authoritative.
+        inserted += result.changes;
+        return;
+      }
+
+      const fieldsAlreadyMatch = existing.upstream_model_id === upstreamModelId
+        && existing.display_name === displayName
+        && existing.sort_order === targetSortOrder
+        && (capabilitiesJson === null || existing.capabilities_json === capabilitiesJson);
+      if (fieldsAlreadyMatch) return;
+
+      const result = updateStmt.run(
+        upstreamModelId,
+        displayName,
+        capabilitiesJson,
+        targetSortOrder,
+        providerId,
+        model.modelId,
+      );
+      updated += result.changes;
+    });
+  });
+  txn();
+
+  return { inserted, updated };
+}
+
 export function getProviderModel(
   providerId: string,
   modelId: string,

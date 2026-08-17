@@ -37,6 +37,7 @@ export async function POST(request: NextRequest) {
       referenceImages: body.referenceImages,
       referenceImagePaths: body.referenceImagePaths,
       sessionId: body.sessionId,
+      abortSignal: request.signal,
     });
 
     return new Response(

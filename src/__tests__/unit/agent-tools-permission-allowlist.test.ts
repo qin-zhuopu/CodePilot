@@ -213,6 +213,10 @@ describe('PERMISSION_SAFE_TOOLS — mutating / side-effect tools that MUST NOT b
       danger: 'calls upstream image-gen API + writes to media library',
     },
     {
+      name: 'codepilot_generate_video',
+      danger: 'calls billed Grok Imagine video API + writes to media library',
+    },
+    {
       name: 'codepilot_import_media',
       danger: 'writes user file into the media library',
     },
@@ -373,6 +377,7 @@ describe('PERMISSION_SAFE_TOOLS — completeness vs capability catalog', () => {
       'codepilot_cancel_task',
       'codepilot_hatch_buddy',
       'codepilot_generate_image',
+      'codepilot_generate_video',
       'codepilot_import_media',
       'codepilot_dashboard_pin',
       'codepilot_dashboard_update',

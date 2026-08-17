@@ -207,6 +207,7 @@ describe('createCodePilotBuiltinTools — mount + skip', () => {
       sessionId: 'chat-1',
       targetProviderId: 'prov-glm',
       workspacePath: '/w',
+      grokVideoAvailable: true,
     });
     // Phase 5d Phase 2 slice 2e (2026-05-17) — the bridge's job is
     // tool mounting + side-channel event emission. Prompt assembly
@@ -228,11 +229,23 @@ describe('createCodePilotBuiltinTools — mount + skip', () => {
 });
 
 describe('CODEPILOT_BUILTIN_TOOL_NAMES — catalog drift guard', () => {
+  it('hides the Grok video bridge when OAuth is unavailable', () => {
+    const bridge = createCodePilotBuiltinTools({
+      sessionId: 'chat-no-grok',
+      targetProviderId: 'prov-glm',
+      grokVideoAvailable: false,
+    });
+    assert.ok(bridge.tools.codepilot_generate_image);
+    assert.equal(bridge.tools.codepilot_generate_video, undefined);
+    assert.equal(bridge.toolNames.has('codepilot_generate_video'), false);
+  });
+
   it('lists exactly the tool names the bridge registers (workspace + non-workspace combined)', () => {
     const bridge = createCodePilotBuiltinTools({
       sessionId: 'chat-1',
       targetProviderId: 'prov-glm',
       workspacePath: '/w',
+      grokVideoAvailable: true,
     });
     const mounted = new Set(Object.keys(bridge.tools));
     const expected = new Set(CODEPILOT_BUILTIN_TOOL_NAMES);

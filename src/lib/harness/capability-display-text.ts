@@ -82,10 +82,10 @@ const CAPABILITY_DISPLAY: Readonly<Record<string, CapabilityDisplay>> = {
     },
   },
   image_generation: {
-    label: { zh: '生成图片', en: 'Generate images' },
+    label: { zh: '生成媒体', en: 'Generate media' },
     description: {
-      zh: '调用图像生成模型，生成图片直接出现在聊天里。',
-      en: 'Calls an image-gen model; images appear inline in chat.',
+      zh: '调用图像或视频生成模型，生成结果直接出现在聊天里。',
+      en: 'Calls an image or video generation model; results appear inline in chat.',
     },
   },
   media_import: {
@@ -302,6 +302,7 @@ export const TOOL_NAME_TO_CAPABILITY_ID: Readonly<Record<string, string>> = {
   codepilot_hatch_buddy: 'assistant_buddy',
   // image_generation
   codepilot_generate_image: 'image_generation',
+  codepilot_generate_video: 'image_generation',
   // media_import
   codepilot_import_media: 'media_import',
   // dashboard (claude_code + codepilot_runtime only)

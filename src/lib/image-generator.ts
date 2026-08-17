@@ -10,6 +10,12 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { isXaiOAuthUsable } from '@/lib/xai-oauth-manager';
+import {
+  readGrokReferenceImages,
+  requestGrokImagineImage,
+  XAI_IMAGINE_IMAGE_MODEL,
+} from '@/lib/xai-imagine';
 
 const dataDir = process.env.CLAUDE_GUI_DATA_DIR || path.join(os.homedir(), '.codepilot');
 const MEDIA_DIR = path.join(dataDir, '.codepilot-media');
@@ -38,14 +44,35 @@ export interface GenerateSingleImageResult {
   /** Actual upstream model id used (resolved from params / extra_env / default) */
   model: string;
   /** Which provider family actually ran */
-  family: 'gemini' | 'openai';
+  family: 'gemini' | 'openai' | 'xai';
 }
 
-type ImageFamily = 'gemini' | 'openai';
+type ImageFamily = 'gemini' | 'openai' | 'xai';
+
+interface XaiImageProviderSelection {
+  providerId?: string;
+  requestedFamily?: ImageFamily;
+  activeProviderId?: string;
+}
+
+/**
+ * Resolve whether image generation should use the Grok Build OAuth media
+ * transport. Explicit media provider wins first, then an explicit image-model
+ * family, and finally the Settings media default. The chat model/provider is
+ * deliberately irrelevant: selecting Grok for text must not silently change
+ * the provider shown in the image confirmation card or bill a different media
+ * account.
+ */
+export function shouldUseXaiOAuthImageProvider(selection: XaiImageProviderSelection): boolean {
+  if (selection.providerId) return selection.providerId === 'xai-oauth';
+  if (selection.requestedFamily) return selection.requestedFamily === 'xai';
+  return selection.activeProviderId === 'xai-oauth';
+}
 
 /** Infer which image family a model id belongs to. gpt-image-* / chatgpt-image-* → OpenAI; otherwise Gemini. */
 function detectFamily(modelId: string | undefined): ImageFamily | undefined {
   if (!modelId) return undefined;
+  if (/^grok-imagine-image/i.test(modelId)) return 'xai';
   if (/^gpt-image|^chatgpt-image/i.test(modelId)) return 'openai';
   if (/^gemini/i.test(modelId)) return 'gemini';
   return undefined;
@@ -279,23 +306,46 @@ export async function generateSingleImage(params: GenerateSingleImageParams): Pr
   const startTime = Date.now();
 
   const requestedFamily = detectFamily(params.model);
-  const { row: provider, family } = pickImageProvider(requestedFamily, params.providerId);
+  const activeProviderId = getSetting('active_image_provider_id') || undefined;
+  const useXaiOAuth = shouldUseXaiOAuthImageProvider({
+    providerId: params.providerId,
+    requestedFamily,
+    activeProviderId,
+  });
+  if (useXaiOAuth && !isXaiOAuthUsable()) {
+    throw new Error('Grok Imagine requires an active Grok Build OAuth login. Reconnect in Settings.');
+  }
+  const selected = useXaiOAuth
+    ? undefined
+    : pickImageProvider(requestedFamily, params.providerId);
+  const provider = selected?.row;
+  const family: ImageFamily = useXaiOAuth ? 'xai' : selected!.family;
 
   // Read configured model from extra_env, fall back to family default
-  let configuredModel = family === 'openai' ? 'gpt-image-2' : 'gemini-3.1-flash-image-preview';
-  try {
-    const env = JSON.parse(provider.extra_env || '{}');
-    const key = family === 'openai' ? 'OPENAI_IMAGE_MODEL' : 'GEMINI_IMAGE_MODEL';
-    if (env[key]) configuredModel = env[key];
-  } catch { /* use default */ }
+  let configuredModel = family === 'xai'
+    ? XAI_IMAGINE_IMAGE_MODEL
+    : family === 'openai'
+      ? 'gpt-image-2'
+      : 'gemini-3.1-flash-image-preview';
+  if (provider) {
+    try {
+      const env = JSON.parse(provider.extra_env || '{}');
+      const key = family === 'openai' ? 'OPENAI_IMAGE_MODEL' : 'GEMINI_IMAGE_MODEL';
+      if (env[key]) configuredModel = env[key];
+    } catch { /* use default */ }
+  }
 
-  const requestedModel = params.model || configuredModel;
+  let requestedModel = params.model || configuredModel;
   const aspectRatio = (params.aspectRatio || '1:1') as `${number}:${number}`;
   const imageSize = params.imageSize || '1K';
+  if (family === 'xai' && imageSize !== '1K' && imageSize !== '2K') {
+    throw new Error('Grok Imagine Image 2.0 supports 1K or 2K resolution.');
+  }
 
   // Collect reference images (base64 strings). Both referenceImagePaths and
   // referenceImages may be provided together.
   const refImageData: string[] = [];
+  const refImagePayloads: Array<{ mimeType: string; data: string }> = [];
   const resolvedReferencePaths: string[] = [];
   if (params.referenceImagePaths && params.referenceImagePaths.length > 0) {
     for (const fp of params.referenceImagePaths) {
@@ -303,21 +353,36 @@ export async function generateSingleImage(params: GenerateSingleImageParams): Pr
       const resolved = path.isAbsolute(fp) ? fp : path.resolve(params.cwd || process.cwd(), fp);
       if (fs.existsSync(resolved)) {
         const buf = fs.readFileSync(resolved);
-        refImageData.push(buf.toString('base64'));
+        const data = buf.toString('base64');
+        refImageData.push(data);
+        if (family === 'xai') {
+          refImagePayloads.push(...readGrokReferenceImages([resolved]));
+        }
         resolvedReferencePaths.push(resolved);
       }
     }
   }
   if (params.referenceImages && params.referenceImages.length > 0) {
     refImageData.push(...params.referenceImages.map(img => img.data));
+    if (family === 'xai') refImagePayloads.push(...params.referenceImages);
   }
 
   let images: { mediaType: string; uint8Array: Uint8Array }[];
 
-  if (family === 'openai') {
+  if (family === 'xai') {
+    const result = await requestGrokImagineImage({
+      prompt: params.prompt,
+      aspectRatio,
+      resolution: imageSize === '2K' ? '2k' : '1k',
+      referenceImages: refImagePayloads,
+      abortSignal: params.abortSignal,
+    });
+    requestedModel = result.model;
+    images = [{ mediaType: result.mimeType, uint8Array: result.bytes }];
+  } else if (family === 'openai') {
     const openai = createOpenAI({
-      apiKey: provider.api_key,
-      baseURL: provider.base_url || undefined,
+      apiKey: provider!.api_key,
+      baseURL: provider!.base_url || undefined,
     });
     const size = mapAspectToOpenAISize(aspectRatio, imageSize, requestedModel);
     // When reference images are present, pass them as `prompt.images` — the
@@ -336,8 +401,8 @@ export async function generateSingleImage(params: GenerateSingleImageParams): Pr
     images = result.images.map(img => ({ mediaType: img.mediaType, uint8Array: img.uint8Array }));
   } else {
     const google = createGoogleGenerativeAI({
-      apiKey: provider.api_key,
-      baseURL: provider.base_url || undefined,
+      apiKey: provider!.api_key,
+      baseURL: provider!.base_url || undefined,
     });
     const prompt = refImageData.length > 0
       ? { text: params.prompt, images: refImageData }

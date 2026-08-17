@@ -1,5 +1,7 @@
 # DeepSeek V4 Flash 0731 适配核验
 
+> **2026-08-13 更新**：本文的 Flash 结论仍保留；V4 Pro 已滚动到 0813，并明确支持第一方 Responses。Pro 能力与 wire 的当前真源见 [Grok 4.6、Grok Build OAuth 与 DeepSeek V4 Pro 0813 适配核验](./grok-4-6-deepseek-v4-pro-0813-adaptation-2026-08-13.md)，下文“Pro 不支持 Responses/仅 High-Max”只代表 2026-08-02 快照。
+
 > 核验日期：2026-08-02
 > 范围：DeepSeek 官方 API、Claude Code、Codex、CodePilot Runtime；ClinePass / OpenCode Go 只核验是否需要跟随声明能力。
 

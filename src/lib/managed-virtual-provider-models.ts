@@ -19,7 +19,21 @@ export const OPENAI_OAUTH_CATALOG_MODELS: CatalogModel[] = [
 ];
 
 export const XAI_OAUTH_CATALOG_MODELS: CatalogModel[] = [
-  { modelId: 'grok-4.5', displayName: 'Grok 4.5' },
+  {
+    modelId: 'grok-4.6',
+    displayName: 'Grok 4.6',
+    capabilities: {
+      reasoning: true,
+      toolUse: true,
+      vision: true,
+      contextWindow: 500_000,
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high'],
+      thinkingMode: 'always',
+      defaultEffortLevel: 'high',
+    },
+  },
+  { modelId: 'grok-4.5', displayName: 'Grok 4.5 (Legacy)' },
 ];
 
 export interface ManagedVirtualProviderModelGroup {
@@ -49,7 +63,7 @@ const MANAGED_VIRTUAL_PROVIDER_DEFINITIONS: Record<
   },
   'xai-oauth': {
     providerId: 'xai-oauth',
-    providerName: 'xAI Grok OAuth',
+    providerName: 'Grok Build OAuth',
     providerType: 'xai-oauth',
     presetKey: 'xai-oauth',
     protocol: 'xai',

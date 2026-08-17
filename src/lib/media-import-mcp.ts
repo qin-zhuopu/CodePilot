@@ -11,6 +11,7 @@
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { importFileToLibrary } from '@/lib/media-saver';
+import { MEDIA_CAPABILITY_SYSTEM_PROMPT } from '@/lib/media-capability-prompt';
 import path from 'path';
 
 /** Must match the marker in image-gen-mcp.ts and claude-client.ts */
@@ -18,22 +19,7 @@ const MEDIA_RESULT_MARKER = '__MEDIA_RESULT__';
 
 // ── System prompt hint ──────────────────────────────────────────────
 
-export const MEDIA_MCP_SYSTEM_PROMPT = `<media-capability>
-You have access to media tools:
-- codepilot_generate_image: Generate images via Gemini. Images appear inline in the chat and are auto-saved to the media library. Always write prompts in English for best results.
-- codepilot_import_media: Import an existing local file (image/video/audio) into the media library and display it inline in the chat.
-
-IMPORTANT RULES:
-1. After ANY CLI tool (dreamina, comfyui, stable-diffusion, midjourney, etc.) generates a media file, you MUST call codepilot_import_media to display it in the chat. Do NOT use the Read tool — Read only shows images to you (the AI) but does NOT display them to the user.
-2. Do NOT use curl or HTTP requests to interact with the media API.
-3. When calling codepilot_import_media, ALWAYS extract and fill in ALL available metadata from the CLI tool's output:
-   - prompt: the generation prompt that was used
-   - model: the model name (e.g. "seedance-2.0", "flux-1", "sdxl")
-   - resolution: the output resolution (e.g. "2K", "4096x4096", "1920x1080")
-   - aspectRatio: the aspect ratio (e.g. "1:1", "16:9")
-   - source: the tool name (e.g. "dreamina", "comfyui")
-   These fields are critical for the media library — do not leave them empty if the information is available in the CLI output or from the generation parameters.
-</media-capability>`;
+export const MEDIA_MCP_SYSTEM_PROMPT = MEDIA_CAPABILITY_SYSTEM_PROMPT;
 
 // ── MCP server factory ──────────────────────────────────────────────
 

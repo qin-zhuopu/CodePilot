@@ -17,6 +17,7 @@ import {
   BASE_MARKDOWN_COMPONENTS,
   MARKDOWN_LINK_CLASS_NAME,
   PREVIEW_MARKDOWN_COMPONENTS,
+  resolveMarkdownImageSrc,
 } from '../../components/markdown/markdown-contract';
 import { remarkResolveLocalLinks } from '../../lib/markdown/local-link-detector';
 
@@ -78,6 +79,35 @@ describe('CodePilot Markdown component contract', () => {
     assert.match(link, /text-blue-600/);
     assert.match(link, /dark:text-blue-400/);
     assert.match(inlineCode, /font-mono/);
+  });
+
+  it('routes managed absolute media paths through the allowlisted serve endpoint', () => {
+    const localPath = '/Users/test/.codepilot/.codepilot-media/generated kitten.png';
+    const expected = `/api/media/serve?path=${encodeURIComponent(localPath)}`;
+    assert.equal(resolveMarkdownImageSrc(localPath), expected);
+
+    const image = renderToStaticMarkup(
+      createElement(PREVIEW_MARKDOWN_COMPONENTS.img, {
+        src: localPath,
+        alt: 'generated kitten',
+      }),
+    );
+    assert.match(image, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  });
+
+  it('supports file URLs and Windows managed media paths without rewriting normal URLs', () => {
+    assert.equal(
+      resolveMarkdownImageSrc('file:///Users/test/.codepilot/.codepilot-media/cat%20one.png'),
+      `/api/media/serve?path=${encodeURIComponent('/Users/test/.codepilot/.codepilot-media/cat one.png')}`,
+    );
+    assert.equal(
+      resolveMarkdownImageSrc('C:\\Users\\test\\.codepilot\\.codepilot-media\\cat.png'),
+      `/api/media/serve?path=${encodeURIComponent('C:\\Users\\test\\.codepilot\\.codepilot-media\\cat.png')}`,
+    );
+    assert.equal(resolveMarkdownImageSrc('https://cdn.example.com/cat.png'), 'https://cdn.example.com/cat.png');
+    assert.equal(resolveMarkdownImageSrc('/images/cat.png'), '/images/cat.png');
+    const blob = new Blob(['image']);
+    assert.equal(resolveMarkdownImageSrc(blob), blob);
   });
 
   it('keeps links visibly blue while preserving caller classes', () => {

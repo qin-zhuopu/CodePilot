@@ -1,7 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSetting, setSetting, getProvider } from '@/lib/db';
 import { getPreset } from '@/lib/provider-catalog';
+import { getXaiOAuthStatus, isXaiOAuthUsable } from '@/lib/xai-oauth-manager';
+import { XAI_IMAGINE_IMAGE_MODEL, XAI_IMAGINE_VIDEO_MODEL } from '@/lib/xai-imagine';
 import type { ApiProvider } from '@/types';
+
+const XAI_OAUTH_MEDIA_PROVIDER_ID = 'xai-oauth';
+
+function xaiOAuthMediaInfo(stale: boolean) {
+  const status = getXaiOAuthStatus();
+  return {
+    providerId: XAI_OAUTH_MEDIA_PROVIDER_ID,
+    stale,
+    providerName: 'Grok Build',
+    providerType: 'xai-oauth',
+    family: 'xai',
+    model: XAI_IMAGINE_IMAGE_MODEL,
+    modelLabel: 'Grok Imagine Image 2.0',
+    videoModel: XAI_IMAGINE_VIDEO_MODEL,
+    videoModelLabel: 'Grok Imagine Video 1.5',
+    email: status.email,
+  };
+}
 
 /**
  * Resolve the model id + friendly label a media provider would currently use.
@@ -41,6 +61,13 @@ function resolveModelForProvider(provider: ApiProvider): { model: string; modelL
 export async function GET() {
   const id = getSetting('active_image_provider_id') || '';
   if (!id) return NextResponse.json({ providerId: '', stale: false });
+
+  // Grok Build is an OAuth-backed virtual media provider, not a row in the
+  // API providers table. Keep it in the same active-image setting so the
+  // settings badge and the actual generator resolve one canonical choice.
+  if (id === XAI_OAUTH_MEDIA_PROVIDER_ID) {
+    return NextResponse.json(xaiOAuthMediaInfo(!isXaiOAuthUsable()));
+  }
 
   const provider = getProvider(id);
   const isMedia = !!provider
@@ -86,6 +113,20 @@ export async function PUT(request: NextRequest) {
     if (providerId === '') {
       setSetting('active_image_provider_id', '');
       return NextResponse.json({ providerId: '', stale: false });
+    }
+
+    if (providerId === XAI_OAUTH_MEDIA_PROVIDER_ID) {
+      if (!isXaiOAuthUsable()) {
+        return NextResponse.json(
+          {
+            error: 'Grok Build OAuth is not usable. Sign in again before setting it as the image-generation default.',
+            code: 'GROK_BUILD_OAUTH_REQUIRED',
+          },
+          { status: 401 },
+        );
+      }
+      setSetting('active_image_provider_id', providerId);
+      return NextResponse.json(xaiOAuthMediaInfo(false));
     }
 
     const provider = getProvider(providerId);

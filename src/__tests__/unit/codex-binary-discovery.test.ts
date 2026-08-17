@@ -471,6 +471,19 @@ describe('Codex auto-review minimum version', () => {
     assert.equal(codexVersionSupportsAutoReview('codex-cli 0.145.0-alpha.19'), true);
     assert.equal(codexVersionSupportsAutoReview('codex-cli 0.145.0'), true);
     assert.equal(codexVersionSupportsAutoReview('codex-cli 0.146.0-alpha.1'), true);
+    assert.equal(
+      codexVersionSupportsAutoReview(
+        'Codex Desktop/0.147.0-alpha.6.5 (Mac OS 26.5.2; arm64) dumb (codex_codepilot; 0.67.0)',
+      ),
+      true,
+    );
+    assert.equal(codexVersionSupportsAutoReview('agent/9.9.9 codex-cli 0.145.0'), false);
+    assert.equal(
+      codexVersionSupportsAutoReview(
+        'agent/9.9.9 Codex Desktop/0.147.0-alpha.6.5 (Mac OS 26.5.2; arm64)',
+      ),
+      false,
+    );
     assert.equal(codexVersionSupportsAutoReview(null), false);
     assert.equal(codexVersionSupportsAutoReview('unknown'), false);
   });

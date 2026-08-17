@@ -39,10 +39,65 @@ import {
 } from '@/lib/harness/builtin-event-bus';
 import { createMediaTools } from '@/lib/builtin-tools/media';
 import type { RuntimeRunEvent } from '@/lib/runtime/contract';
+import { promptNeedsMedia } from '@/lib/media-capability-prompt';
+import { extractMcpAbortSignal } from '@/lib/image-gen-mcp';
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 const readSrc = (rel: string): string =>
   fs.readFileSync(path.join(REPO_ROOT, rel), 'utf-8');
+
+describe('Claude SDK media intent gate', () => {
+  for (const prompt of [
+    'Generate an image of a small cat',
+    'Use the Image model to generate a kitten',
+    'Draw me a poster for the launch',
+    'Create a short video from this photo',
+    '帮我画一张小猫图片',
+  ]) {
+    it(`mounts media tools for: ${prompt}`, () => {
+      assert.equal(promptNeedsMedia(prompt), true);
+    });
+  }
+
+  it('does not mount the paid media tools for an ordinary text request', () => {
+    assert.equal(promptNeedsMedia('Explain how OAuth PKCE works'), false);
+  });
+
+  it('the shipping Claude client uses the shared bilingual predicate for MCP mounting', () => {
+    const source = readSrc('src/lib/claude-client.ts');
+    assert.match(source, /promptNeedsMedia\(prompt,\s*conversationHistory\)/);
+    assert.match(source, /needsMediaMcp\s*=\s*!isHeartbeatMode\s*&&/);
+  });
+
+  it('the Claude MCP only registers Grok video when OAuth is usable', () => {
+    const source = readSrc('src/lib/image-gen-mcp.ts');
+    assert.match(source, /isXaiOAuthUsable\(\)/);
+    assert.match(source, /\.\.\.\(isXaiOAuthUsable\(\)\s*\?\s*\[/);
+  });
+});
+
+describe('media cancellation wiring', () => {
+  it('extracts the exact Claude MCP handler signal and rejects lookalikes', () => {
+    const controller = new AbortController();
+    assert.equal(extractMcpAbortSignal({ signal: controller.signal }), controller.signal);
+    assert.equal(extractMcpAbortSignal({ signal: { aborted: false } }), undefined);
+    assert.equal(extractMcpAbortSignal(undefined), undefined);
+  });
+
+  it('threads cancellation through Claude MCP, Codex bridge, Native and confirmation API', () => {
+    const claudeMcp = readSrc('src/lib/image-gen-mcp.ts');
+    assert.equal((claudeMcp.match(/abortSignal:\s*extractMcpAbortSignal\(extra\)/g) || []).length, 2);
+
+    const codexBridge = readSrc('src/lib/codex/proxy/builtin-bridge.ts');
+    assert.equal((codexBridge.match(/abortSignal:\s*execOptions\.abortSignal/g) || []).length >= 2, true);
+
+    const nativeMedia = readSrc('src/lib/builtin-tools/media.ts');
+    assert.equal((nativeMedia.match(/abortSignal:\s*execution\?\.abortSignal/g) || []).length >= 2, true);
+
+    const confirmationRoute = readSrc('src/app/api/media/generate/route.ts');
+    assert.match(confirmationRoute, /abortSignal:\s*request\.signal/);
+  });
+});
 
 function stripComments(src: string): string {
   const out: string[] = [];
@@ -69,18 +124,30 @@ function stripComments(src: string): string {
 // ─────────────────────────────────────────────────────────────────────
 
 describe('createMediaTools — tool factory shape', () => {
-  it('returns codepilot_import_media + codepilot_generate_image with execute()', () => {
-    const tools = createMediaTools({ sessionId: 's1' });
+  it('returns import + image + video media tools with execute()', () => {
+    const tools = createMediaTools({ sessionId: 's1', grokVideoAvailable: true });
     assert.ok(tools.codepilot_import_media);
     assert.ok(tools.codepilot_generate_image);
+    assert.ok(tools.codepilot_generate_video);
     assert.equal(
       typeof (tools.codepilot_import_media as { execute?: unknown }).execute,
+      'function',
+    );
+    assert.equal(
+      typeof (tools.codepilot_generate_video as { execute?: unknown }).execute,
       'function',
     );
     assert.equal(
       typeof (tools.codepilot_generate_image as { execute?: unknown }).execute,
       'function',
     );
+  });
+
+  it('hides Grok video when OAuth is unavailable without hiding active-provider images', () => {
+    const tools = createMediaTools({ sessionId: 's1', grokVideoAvailable: false });
+    assert.ok(tools.codepilot_import_media);
+    assert.ok(tools.codepilot_generate_image);
+    assert.equal(tools.codepilot_generate_video, undefined);
   });
 });
 
@@ -95,7 +162,7 @@ describe('createMediaTools — tool factory shape', () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe('codepilot_import_media — side-channel emit on failure', () => {
-  it('returns "Failed: ..." text on import failure; emits no MediaBlock event', async () => {
+  it('rejects import failures so the runtime emits a real tool error; emits no MediaBlock event', async () => {
     __resetBuiltinEventBusForTests();
     const sessionId = 'sess-import-fail';
     const captured: RuntimeRunEvent[] = [];
@@ -104,15 +171,12 @@ describe('codepilot_import_media — side-channel emit on failure', () => {
     const tools = createMediaTools({ sessionId });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const importTool = tools.codepilot_import_media as any;
-    const result = await importTool.execute(
-      { filePath: '/non/existent/file.png' },
-      { toolCallId: 'call-1' },
+    await assert.rejects(
+      () => importTool.execute(
+        { filePath: '/non/existent/file.png' },
+        { toolCallId: 'call-1' },
+      ),
     );
-
-    // Result is plain text. Critically, NOT a JSON blob containing
-    // MediaBlock structure — the model only sees a clean message.
-    assert.equal(typeof result, 'string');
-    assert.match(result as string, /Failed:|Media imported:/);
 
     // No side-channel emit on failure (the importFileToLibrary call
     // threw before the emit block ran).
@@ -294,9 +358,11 @@ describe('codepilot_import_media — no double emit when toolCallId missing', ()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const importTool = tools.codepilot_import_media as any;
     // Pass execOptions WITHOUT toolCallId — emit must skip
-    await importTool.execute(
-      { filePath: '/some/path.png' },
-      { /* no toolCallId */ },
+    await assert.rejects(
+      () => importTool.execute(
+        { filePath: '/some/path.png' },
+        { /* no toolCallId */ },
+      ),
     );
 
     const mediaEmits = captured.filter(

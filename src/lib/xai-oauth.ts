@@ -1,9 +1,9 @@
 /**
  * xAI OAuth protocol primitives.
  *
- * Compatibility source: OpenCode's xAI integration uses the public Grok CLI
- * client below. This is not a CodePilot-owned client and xAI may revoke or
- * restrict it; UI and release notes must keep that risk visible.
+ * Compatibility source: xAI's open-source Grok Build client. The OAuth client
+ * is not CodePilot-owned, so UI and release notes must keep the upstream-policy
+ * dependency visible and preserve API Key as an independent fallback.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { envProxyFetch } from './env-proxy-fetch';
@@ -12,9 +12,40 @@ export const XAI_OAUTH_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
 export const XAI_OAUTH_AUTHORIZE_URL = 'https://auth.x.ai/oauth2/authorize';
 export const XAI_OAUTH_TOKEN_URL = 'https://auth.x.ai/oauth2/token';
 export const XAI_OAUTH_DEVICE_URL = 'https://auth.x.ai/oauth2/device/code';
-export const XAI_OAUTH_SCOPE = 'openid profile email offline_access grok-cli:access api:access';
-export const XAI_OAUTH_CALLBACK_PORT = 56121;
-export const XAI_OAUTH_REDIRECT_URI = `http://127.0.0.1:${XAI_OAUTH_CALLBACK_PORT}/callback`;
+export const XAI_OAUTH_SCOPE = [
+  'openid',
+  'profile',
+  'email',
+  'offline_access',
+  'grok-cli:access',
+  'api:access',
+  'conversations:read',
+  'conversations:write',
+  'workspaces:read',
+  'workspaces:write',
+].join(' ');
+export const XAI_GROK_BUILD_API_BASE_URL = 'https://cli-chat-proxy.grok.com/v1';
+export const XAI_GROK_BUILD_TOKEN_HEADER = 'xai-grok-cli';
+/**
+ * Grok Build compatibility profile pinned to xai-org/grok-build
+ * e5fd4816d43260c15ba785f103990c1ed6cea230 (xai-grok-version 1.0.3).
+ * This is deliberately not CodePilot's app version: the Build proxy applies
+ * its version gate against the upstream Grok client contract.
+ */
+export const XAI_GROK_BUILD_CLIENT_VERSION = '1.0.3';
+export const XAI_GROK_BUILD_CLIENT_IDENTIFIER = 'codepilot';
+export const XAI_GROK_BUILD_CLIENT_MODE = 'interactive';
+export const XAI_GROK_BUILD_AUTHENTICATE_RESPONSE = 'authenticate-response';
+export const XAI_GROK_BUILD_RESPONSES_PATH = '/v1/responses';
+export const XAI_OAUTH_CALLBACK_HOST = '127.0.0.1';
+export const XAI_OAUTH_CALLBACK_PATH = '/callback';
+
+export function buildXaiOAuthRedirectUri(port: number): string {
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error('xAI OAuth callback port is invalid.');
+  }
+  return `http://${XAI_OAUTH_CALLBACK_HOST}:${port}${XAI_OAUTH_CALLBACK_PATH}`;
+}
 
 export interface XaiOAuthTokenBundle {
   accessToken: string;
@@ -93,7 +124,7 @@ function randomBase64Url(bytes = 32): string {
   return randomBytes(bytes).toString('base64url');
 }
 
-export function prepareXaiBrowserFlow(): XaiPreparedBrowserFlow {
+export function prepareXaiBrowserFlow(redirectUri: string): XaiPreparedBrowserFlow {
   const state = randomBase64Url();
   const nonce = randomBase64Url();
   const codeVerifier = randomBase64Url(48);
@@ -101,14 +132,13 @@ export function prepareXaiBrowserFlow(): XaiPreparedBrowserFlow {
   const params = new URLSearchParams({
     client_id: XAI_OAUTH_CLIENT_ID,
     response_type: 'code',
-    redirect_uri: XAI_OAUTH_REDIRECT_URI,
+    redirect_uri: redirectUri,
     scope: XAI_OAUTH_SCOPE,
     code_challenge: codeChallenge,
     code_challenge_method: 'S256',
     state,
     nonce,
-    plan: 'generic',
-    referrer: 'codepilot',
+    referrer: 'grok-build',
   });
   return { authUrl: `${XAI_OAUTH_AUTHORIZE_URL}?${params}`, state, nonce, codeVerifier };
 }
@@ -204,6 +234,7 @@ export async function exchangeXaiAuthorizationCode(
   code: string,
   codeVerifier: string,
   expectedNonce: string,
+  redirectUri: string,
   fetchImpl: typeof fetch = envProxyFetch,
   signal?: AbortSignal,
 ): Promise<XaiOAuthTokenResponse> {
@@ -211,7 +242,7 @@ export async function exchangeXaiAuthorizationCode(
     grant_type: 'authorization_code',
     client_id: XAI_OAUTH_CLIENT_ID,
     code,
-    redirect_uri: XAI_OAUTH_REDIRECT_URI,
+    redirect_uri: redirectUri,
     code_verifier: codeVerifier,
   }), fetchImpl, undefined, signal);
   if (signal?.aborted) throw new Error('xAI OAuth flow cancelled.');
@@ -245,7 +276,11 @@ export async function requestXaiDeviceAuthorization(
   const response = await fetchImpl(XAI_OAUTH_DEVICE_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-    body: new URLSearchParams({ client_id: XAI_OAUTH_CLIENT_ID, scope: XAI_OAUTH_SCOPE }).toString(),
+    body: new URLSearchParams({
+      client_id: XAI_OAUTH_CLIENT_ID,
+      scope: XAI_OAUTH_SCOPE,
+      referrer: 'grok-build',
+    }).toString(),
   });
   if (!response.ok) throw await parseTokenError(response);
   const data = await response.json() as Record<string, unknown>;

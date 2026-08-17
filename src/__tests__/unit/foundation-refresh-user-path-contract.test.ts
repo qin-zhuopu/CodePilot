@@ -8,6 +8,8 @@
  * control, so a helper result is not sufficient evidence for these outcomes.
  */
 
+import '../db-isolation.setup';
+
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -16,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { NextRequest } from 'next/server';
 import {
   createProvider,
+  deleteProviderModel,
+  getDb,
   deleteProvider,
   getAllModelsForProvider,
   getAllProviders,
@@ -29,7 +33,17 @@ import {
   GET as modelsGET,
   normalizeModelCapabilitySurface,
 } from '@/app/api/providers/models/route';
+import {
+  GET as providerModelsGET,
+  PATCH as providerModelsPATCH,
+  POST as providerModelsPOST,
+} from '@/app/api/providers/[id]/models/route';
 import { POST as searchModelsPOST } from '@/app/api/providers/[id]/search-models/route';
+import {
+  buildSearchCandidateMutation,
+  filterSearchCandidates,
+  type SearchCandidate,
+} from '@/components/settings/OpenRouterSearchDialog';
 
 const TEST_PROVIDER_PREFIX = '__test_foundation_user_path_';
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -218,6 +232,35 @@ describe('U2 — the real Kimi for Coding DB shape is enriched, not shadowed', (
 });
 
 describe('U3 — CodePlan add-model is not held hostage by an optional upstream index', () => {
+  it('filters by the displayed upstream id and turns hidden candidates into PATCH', () => {
+    const candidate: SearchCandidate = {
+      modelId: 'sonnet',
+      upstreamModelId: 'glm-5.3[1m]',
+      displayName: 'GLM-5.3',
+      alreadyAdded: true,
+      existingHidden: true,
+      existingModelId: 'glm-5.3[1m]',
+    };
+    assert.deepEqual(filterSearchCandidates([candidate], '5.3[1m]'), [candidate]);
+    assert.deepEqual(buildSearchCandidateMutation(candidate), {
+      method: 'PATCH',
+      body: { model_id: 'glm-5.3[1m]', enabled: 1 },
+    });
+    assert.deepEqual(buildSearchCandidateMutation({
+      ...candidate,
+      alreadyAdded: false,
+      existingHidden: false,
+      existingModelId: undefined,
+    }), {
+      method: 'POST',
+      body: {
+        model_id: 'sonnet',
+        upstream_model_id: 'glm-5.3[1m]',
+        display_name: 'GLM-5.3',
+      },
+    });
+  });
+
   it('falls back to the built-in GLM plan catalog when /models is unreachable', async () => {
     const provider = createProvider({
       name: `${TEST_PROVIDER_PREFIX}glm_${Date.now()}`,
@@ -245,15 +288,288 @@ describe('U3 — CodePlan add-model is not held hostage by an optional upstream 
         'GLM CodePlan has a curated SKU catalog; upstream index failure must not make Add Model unusable',
       );
       const body = await response.json() as {
-        candidates: Array<{ modelId: string; displayName: string; alreadyAdded: boolean }>;
+        candidates: Array<{
+          modelId: string;
+          upstreamModelId?: string;
+          displayName: string;
+          alreadyAdded: boolean;
+          existingHidden?: boolean;
+          existingModelId?: string;
+        }>;
       };
-      assert.ok(
-        body.candidates.some(candidate => candidate.displayName === 'GLM-5.2'),
-        'the fallback must expose the current curated GLM-5.2 entry',
-      );
+      const flagship = body.candidates.find(candidate => candidate.displayName === 'GLM-5.3');
+      assert.ok(flagship, 'the fallback must expose the current curated GLM-5.3 entry');
+      assert.equal(flagship.modelId, 'sonnet', 'candidate must keep the stable local catalog id');
+      assert.equal(flagship.upstreamModelId, 'glm-5.3[1m]', 'wire id must stay separate from the DB id');
+      assert.equal(flagship.alreadyAdded, false);
+      assert.equal(flagship.existingHidden, false);
+      assert.equal(flagship.existingModelId, undefined);
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('upgrades a pristine GLM-5.2 snapshot before Add Model claims GLM-5.3 is already added', async () => {
+    const provider = createProvider({
+      name: `${TEST_PROVIDER_PREFIX}glm_stale_${Date.now()}`,
+      provider_type: 'anthropic',
+      protocol: 'anthropic',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      api_key: 'sk-test',
+      extra_env: '{}',
+    });
+    upsertProviderModel({
+      provider_id: provider.id,
+      model_id: 'sonnet',
+      upstream_model_id: 'sonnet',
+      display_name: 'GLM-5.2',
+      capabilities_json: JSON.stringify({
+        supportsEffort: true,
+        supportedEffortLevels: ['high', 'max'],
+      }),
+      sort_order: 0,
+      enabled: 1,
+      source: 'catalog',
+      user_edited: 0,
+      enable_source: 'catalog',
+    });
+    upsertProviderModel({
+      provider_id: provider.id,
+      model_id: 'haiku',
+      upstream_model_id: 'haiku',
+      display_name: 'GLM-4.5-Air',
+      sort_order: 1,
+      enabled: 1,
+      source: 'catalog',
+      user_edited: 0,
+      enable_source: 'catalog',
+    });
+    upsertProviderModel({
+      provider_id: provider.id,
+      model_id: 'user/custom-model',
+      upstream_model_id: 'user/custom-model',
+      display_name: 'My custom GLM',
+      sort_order: 99,
+      enabled: 0,
+      source: 'manual',
+      user_edited: 1,
+      enable_source: 'manual_hidden',
+    });
+
+    const modelsResponse = await providerModelsGET(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/models?all=1`),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(modelsResponse.status, 200);
+    const modelsBody = await modelsResponse.json() as {
+      models: Array<{
+        model_id: string;
+        upstream_model_id: string;
+        display_name: string;
+        enabled: number;
+        user_edited: number;
+        enable_source: string;
+      }>;
+    };
+    const byId = new Map(modelsBody.models.map(model => [model.model_id, model]));
+    assert.equal(byId.get('sonnet')?.display_name, 'GLM-5.3');
+    assert.equal(byId.get('sonnet')?.upstream_model_id, 'glm-5.3[1m]');
+    const persistedCapabilities = JSON.parse(
+      getAllModelsForProvider(provider.id).find(model => model.model_id === 'sonnet')!.capabilities_json,
+    );
+    assert.equal(persistedCapabilities.supportsEffort, true);
+    assert.deepEqual(persistedCapabilities.supportedEffortLevels, ['low', 'high', 'max']);
+    assert.equal(persistedCapabilities.defaultEffortLevel, 'max');
+    assert.equal(persistedCapabilities.effortNoteKey, 'messageInput.effort.note.glmCodePlan');
+    assert.equal(byId.get('glm-5-turbo')?.display_name, 'GLM-5-Turbo', 'new catalog ids must materialize');
+    assert.equal(byId.get('haiku')?.display_name, 'GLM-4.7');
+    assert.equal(byId.get('user/custom-model')?.display_name, 'My custom GLM');
+    assert.equal(byId.get('user/custom-model')?.enabled, 0, 'manual hidden choice must survive catalog merge');
+    assert.equal(byId.get('user/custom-model')?.user_edited, 1);
+    assert.equal(byId.get('user/custom-model')?.enable_source, 'manual_hidden');
+
+    const searchResponse = await searchModelsPOST(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/search-models`, { method: 'POST' }),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(searchResponse.status, 200);
+    const searchBody = await searchResponse.json() as {
+      candidates: Array<{
+        modelId: string;
+        upstreamModelId?: string;
+        displayName: string;
+        alreadyAdded: boolean;
+        existingHidden?: boolean;
+        existingModelId?: string;
+      }>;
+    };
+    const flagship = searchBody.candidates.find(candidate => candidate.displayName === 'GLM-5.3');
+    assert.deepEqual(flagship, {
+      modelId: 'sonnet',
+      upstreamModelId: 'glm-5.3[1m]',
+      displayName: 'GLM-5.3',
+      alreadyAdded: true,
+      existingHidden: false,
+      existingModelId: 'sonnet',
+    });
+
+    const changesBeforeRepeat = Number(
+      (getDb().prepare('SELECT total_changes() AS count').get() as { count: number }).count,
+    );
+    const repeatedModelsResponse = await providerModelsGET(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/models?all=1`),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(repeatedModelsResponse.status, 200);
+    const changesAfterRepeat = Number(
+      (getDb().prepare('SELECT total_changes() AS count').get() as { count: number }).count,
+    );
+    assert.equal(
+      changesAfterRepeat,
+      changesBeforeRepeat,
+      'a second Models GET against current catalog metadata must perform zero writes',
+    );
+  });
+
+  it('keeps a hidden upstream-id row actionable instead of claiming it is simply added', async () => {
+    const provider = createProvider({
+      name: `${TEST_PROVIDER_PREFIX}glm_hidden_${Date.now()}`,
+      provider_type: 'anthropic',
+      protocol: 'anthropic',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      api_key: 'sk-test',
+      extra_env: '{}',
+    });
+    upsertProviderModel({
+      provider_id: provider.id,
+      model_id: 'glm-5.3[1m]',
+      upstream_model_id: 'glm-5.3[1m]',
+      display_name: 'My hidden GLM-5.3 route',
+      capabilities_json: JSON.stringify({ private: true }),
+      sort_order: 7,
+      enabled: 0,
+      source: 'manual',
+      user_edited: 1,
+      enable_source: 'manual_hidden',
+    });
+
+    const searchResponse = await searchModelsPOST(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/search-models`, { method: 'POST' }),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(searchResponse.status, 200);
+    const searchBody = await searchResponse.json() as {
+      candidates: Array<{
+        modelId: string;
+        upstreamModelId?: string;
+        displayName: string;
+        alreadyAdded: boolean;
+        existingHidden?: boolean;
+        existingModelId?: string;
+      }>;
+    };
+    const flagship = searchBody.candidates.find(candidate => candidate.modelId === 'sonnet');
+    assert.deepEqual(flagship, {
+      modelId: 'sonnet',
+      upstreamModelId: 'glm-5.3[1m]',
+      displayName: 'GLM-5.3',
+      alreadyAdded: true,
+      existingHidden: true,
+      existingModelId: 'glm-5.3[1m]',
+    });
+
+    const enableResponse = await providerModelsPATCH(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/models`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model_id: flagship!.existingModelId, enabled: 1 }),
+      }),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(enableResponse.status, 200);
+    const restored = getAllModelsForProvider(provider.id).find(
+      model => model.model_id === 'glm-5.3[1m]',
+    )!;
+    assert.equal(restored.enabled, 1);
+    assert.equal(restored.enable_source, 'manual_enabled');
+    assert.equal(restored.display_name, 'My hidden GLM-5.3 route');
+    assert.deepEqual(JSON.parse(restored.capabilities_json), { private: true });
+  });
+
+  it('re-adding a deleted plan candidate restores catalog ownership and capabilities', async () => {
+    const provider = createProvider({
+      name: `${TEST_PROVIDER_PREFIX}glm_readd_${Date.now()}`,
+      provider_type: 'anthropic',
+      protocol: 'anthropic',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      api_key: 'sk-test',
+      extra_env: '{}',
+    });
+    const firstModelsResponse = await providerModelsGET(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/models?all=1`),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(firstModelsResponse.status, 200);
+    assert.equal(deleteProviderModel(provider.id, 'sonnet'), true);
+
+    const addResponse = await providerModelsPOST(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/models`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // This is the exact body the search dialog sends. Catalog facts must
+        // be recovered server-side rather than trusted from the renderer.
+        body: JSON.stringify({
+          model_id: 'sonnet',
+          upstream_model_id: 'glm-5.3[1m]',
+          display_name: 'GLM-5.3',
+        }),
+      }),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(addResponse.status, 200);
+    const restored = getAllModelsForProvider(provider.id).find(model => model.model_id === 'sonnet')!;
+    assert.equal(restored.source, 'catalog');
+    assert.equal(restored.user_edited, 0);
+    assert.equal(restored.enable_source, 'catalog');
+    assert.equal(restored.upstream_model_id, 'glm-5.3[1m]');
+    const caps = JSON.parse(restored.capabilities_json);
+    assert.equal(caps.contextWindow, 1_048_576);
+    assert.equal(caps.supportsEffort, true);
+    assert.deepEqual(caps.supportedEffortLevels, ['low', 'high', 'max']);
+  });
+
+  it('does not run the catalog merge for a non-plan provider with starter defaults', async () => {
+    const provider = createProvider({
+      name: `${TEST_PROVIDER_PREFIX}anthropic_${Date.now()}`,
+      provider_type: 'anthropic',
+      protocol: 'anthropic',
+      base_url: 'https://api.anthropic.com',
+      api_key: 'sk-test',
+      extra_env: '{}',
+    });
+    upsertProviderModel({
+      provider_id: provider.id,
+      model_id: 'sonnet',
+      upstream_model_id: 'legacy-sonnet-wire',
+      display_name: 'My untouched starter row',
+      capabilities_json: JSON.stringify({ private: true }),
+      sort_order: 9,
+      enabled: 1,
+      source: 'catalog',
+      user_edited: 0,
+      enable_source: 'catalog',
+    });
+
+    const response = await providerModelsGET(
+      new NextRequest(`http://localhost/api/providers/${provider.id}/models?all=1`),
+      { params: Promise.resolve({ id: provider.id }) },
+    );
+    assert.equal(response.status, 200);
+    const rows = getAllModelsForProvider(provider.id);
+    assert.equal(rows.length, 1, 'starter catalog providers must not receive plan-only inserts on read');
+    assert.equal(rows[0].display_name, 'My untouched starter row');
+    assert.equal(rows[0].upstream_model_id, 'legacy-sonnet-wire');
+    assert.deepEqual(JSON.parse(rows[0].capabilities_json), { private: true });
   });
 });
 

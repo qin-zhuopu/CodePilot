@@ -1454,14 +1454,8 @@ export function streamClaudeSdk(options: ClaudeStreamOptions): ReadableStream<st
         // Codex P1 — heartbeat never needs media tools; skip even
         // before keyword evaluation so a HEARTBEAT.md mentioning the
         // word "图片" can't accidentally pull the MCP in.
-        const needsMediaMcp = !isHeartbeatMode && (() => {
-          const mediaKeywords = /生成图片|画一|图像|图片|素材|保存.*素材|import.*library|save.*library|codepilot_import_media|codepilot_generate_image/i;
-          if (mediaKeywords.test(prompt)) return true;
-          if (conversationHistory?.some(m =>
-            mediaKeywords.test(m.content)
-          )) return true;
-          return false;
-        })();
+        const { promptNeedsMedia } = await import('@/lib/media-capability-prompt');
+        const needsMediaMcp = !isHeartbeatMode && promptNeedsMedia(prompt, conversationHistory);
 
         if (needsMediaMcp) {
           const { createMediaImportMcpServer } = await import('@/lib/media-import-mcp');
@@ -3464,7 +3458,7 @@ async function testXaiConnection(config: {
   const timeoutId = setTimeout(() => controller.abort(), 15_000);
 
   try {
-    const response = await fetch(`${baseUrl}/models/grok-4.5`, {
+    const response = await fetch(`${baseUrl}/models/grok-4.6`, {
       method: 'GET',
       headers: { Authorization: `Bearer ${config.apiKey}` },
       signal: controller.signal,
